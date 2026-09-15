@@ -1,0 +1,11 @@
+.env
+node_modules/
+dist/
+ .gitignore
+accounts/
+akunbot
+akunril
+package-lock.json
+package.json
+src/
+tsconfig.json
