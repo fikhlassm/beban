@@ -1,0 +1,22 @@
+{
+  "name": "facebook-auto-poster",
+  "version": "1.0.0",
+  "description": "Facebook multi-account group poster",
+  "main": "dist/facebook-multi-account-worker.js",
+"scripts": {
+  "start": "tsx src/facebook-multi-account-worker.ts",
+  "build": "tsc",
+  "dev": "tsx src/facebook-multi-account-worker.ts",
+  "dashboard": "tsx src/telegram-dashboard.ts"
+},
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "puppeteer": "^24.20.0",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
