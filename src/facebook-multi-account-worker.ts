@@ -96,6 +96,20 @@ async function waitWithStopCheck(ms: number): Promise<boolean> {
 const NAV_TIMEOUT = 80000;   // 80 detik untuk navigasi
 const WAIT_TIMEOUT = 10000;  // 10 detik untuk waitForSelector
 
+// Pacing antar posting. Bisa dioverride lewat environment variable.
+// Delay ini hanya memberi jeda antar aksi dan tidak menjamin lolos dari rate-limit Facebook.
+const POST_DELAY_MIN_MS = Number(process.env.POST_DELAY_MIN_MS || "20000");
+const POST_DELAY_MAX_MS = Number(process.env.POST_DELAY_MAX_MS || "40000");
+
+// Jika UI gagal terdeteksi, grup yang sama dicoba lagi agar tidak diam-diam ter-skip.
+const MAX_POST_ATTEMPTS = Number(process.env.MAX_POST_ATTEMPTS || "2");
+
+// Safety-net: kalau ada N grup BERTURUT-TURUT yang gagal (bukan LIMIT terverifikasi),
+// worker berhenti sepenuhnya. Ini untuk berjaga-jaga kalau sebenarnya akun sedang
+// kena limit tapi tidak lolos terdeteksi oleh detectFacebookPostingRestriction/detectLimitOnly.
+// Set ke 0 untuk menonaktifkan safety-net ini (grup gagal akan terus di-skip tanpa batas).
+const MAX_CONSECUTIVE_SKIPS = Number(process.env.MAX_CONSECUTIVE_SKIPS || "5");
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface Progress {
   accountId: string;
@@ -113,6 +127,18 @@ interface PostingStats {
   limited: number;
   unknown: number;
   lastUpdated: string;
+  // Bucket per hari (kunci tanggal lokal "YYYY-MM-DD"). Dipertahankan saat
+  // reset lifetime supaya riwayat harian untuk ringkasan dashboard tidak terputus.
+  daily?: Record<string, DailyStat>;
+}
+
+interface DailyStat {
+  total: number;
+  direct: number;
+  pending: number;
+  error: number;
+  limited: number;
+  unknown: number;
 }
 
 type PostingResultStatus =
@@ -134,9 +160,44 @@ interface AccountConfig {
 }
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
+// Rotasi log.txt → log-<tanggal>.txt setiap kali tanggal berganti supaya file
+// tidak tumbuh tanpa batas. Rotasi hanya terpicu saat worker menulis log.
+let logDay = "";           // cache tanggal lokal terakhir pada log()
+const LOG_ROTATE_KEEP_DAYS = 7;
+
+async function rotateLog(today: string): Promise<void> {
+  try {
+    const stat = await fs.stat(LOG_FILE);
+    const staleDay = new Date(stat.mtime).toLocaleDateString("sv-SE");
+    if (staleDay !== today) {
+      await fs.rename(LOG_FILE, path.join(ACCOUNT_DIR, `log-${staleDay}.txt`));
+    }
+  } catch {
+    // log.txt belum ada / tidak bisa di-rename — biarkan
+  }
+
+  try {
+    const entries = await fs.readdir(ACCOUNT_DIR);
+    const cutoff = Date.now() - LOG_ROTATE_KEEP_DAYS * 24 * 60 * 60 * 1000;
+    for (const entry of entries) {
+      if (!/^log-\d{4}-\d{2}-\d{2}\.txt$/.test(entry)) continue;
+      const full = path.join(ACCOUNT_DIR, entry);
+      try {
+        const st = await fs.stat(full);
+        if (st.mtimeMs < cutoff) await fs.unlink(full).catch(() => {});
+      } catch {}
+    }
+  } catch {}
+}
+
 async function log(message: string): Promise<void> {
-  const ts = new Date().toISOString();
-  const line = `[${ts}] ${message}`;
+  const now = new Date();
+  const today = now.toLocaleDateString("sv-SE");
+  if (today !== logDay) {
+    logDay = today;
+    await rotateLog(today);
+  }
+  const line = `[${now.toISOString()}] ${message}`;
   console.log(line);
   await fs.appendFile(LOG_FILE, line + "\n").catch(() => {});
 }
@@ -151,10 +212,20 @@ async function randomDelay(minMs: number, maxMs: number): Promise<void> {
 }
 
 // ─── Progress Management ──────────────────────────────────────────────────────
+// JSON.parse yang aman terhadap BOM (editor seperti Notepad menambahkan BOM).
+function parseJsonSafe<T>(raw: string): T | null {
+  try {
+    return JSON.parse(raw.replace(/^\uFEFF/, "")) as T;
+  } catch {
+    return null;
+  }
+}
+
 async function loadProgress(): Promise<Progress | null> {
   try {
     const raw = await fs.readFile(PROGRESS_FILE, "utf-8");
-    const progress = JSON.parse(raw) as Progress;
+    const progress = parseJsonSafe<Progress>(raw);
+    if (!progress) return null;
     if (progress.accountId && progress.accountId !== ACCOUNT_ID) {
       return null;
     }
@@ -210,9 +281,11 @@ async function loadContentBatch(batchIndex: number): Promise<ContentBatch> {
 
 // ─── Cookie & LocalStorage ────────────────────────────────────────────────────
 async function loadCookieAndLocalStorage(page: Page): Promise<void> {
-  // cookie.txt dan localstorage.txt bersifat OPSIONAL.
-  // Session utama dipertahankan oleh persistent browser profile.
-  // Jika file kosong/belum ada, worker tetap bisa berjalan.
+  // cookie.txt & localstorage.txt = BOOTSTRAP untuk profil yang tidak punya
+  // session (rebuild / PC baru). Profil persistent adalah sumber kebenaran;
+  // file tidak pernah di-inject saat profil masih login karena menimpa
+  // cookie valid dengan nilai basi membuat FB logout/checkpoint. File
+  // di-refresh otomatis via exportSessionFiles() setiap sesi login valid.
 
   let cookieCount = 0;
   let localStorageCount = 0;
@@ -351,6 +424,329 @@ async function loadCookieAndLocalStorage(page: Page): Promise<void> {
   );
 }
 
+// Deteksi apakah halaman Facebook masih "belum login".
+// ANDA: cookie `c_user` (hanya ada saat login) TIDAK ada, ATAU url /login,
+// ATAU ada login form. Jangan andalkan DOM saja — homepage log-out dengan
+// dropdown login pernah lolos deteksi DOM dan bikin sesi tidak di-load.
+async function checkNeedsLogin(page: Page): Promise<boolean> {
+  try {
+    await page.goto("https://web.facebook.com/", {
+      waitUntil: "domcontentloaded",
+      timeout: NAV_TIMEOUT,
+    });
+  } catch (error) {
+    await log(`⚠️ Gagal membuka halaman Facebook: ${error}`);
+  }
+  await randomDelay(2000, 3000);
+  try {
+    const cookies = await page.cookies(
+      "https://web.facebook.com",
+      "https://www.facebook.com"
+    );
+    const hasCuser = cookies.some((c) => c.name === "c_user" && !!c.value);
+    const url = page.url().toLowerCase();
+    const hasLoginForm = await page
+      .evaluate(
+        () =>
+          !!(
+            document.querySelector('input[name="email"]') ||
+            document.querySelector('input[name="pass"]')
+          )
+      )
+      .catch(() => false);
+    return !hasCuser || url.includes("/login") || hasLoginForm;
+  } catch {
+    // Halaman gagal dievaluasi (tab error dsb) → anggap belum login.
+    return true;
+  }
+}
+
+// Snapshot session browser yang HIDUP ke file bootstrap setiap login
+// terverifikasi. Hanya dipanggil dari jalur login-valid — jangan pernah
+// menimpa file dengan isi profil yang belum login. Format kompatibel dengan
+// parser loadCookieAndLocalStorage (kolom ke-5 tidak dipakai, ✓ = true).
+async function exportSessionFiles(page: Page): Promise<void> {
+  try {
+    const cookies = await page.cookies(
+      "https://web.facebook.com",
+      "https://www.facebook.com"
+    );
+
+    // Proteksi: tanpa c_user = profil tidak benar-benar login → JANGAN
+    // menimpa file bootstrap (cookie anonim tidak berharga & bisa menghapus
+    // file yang barusan dipaste user).
+    const loggedIn = cookies.some((c) => c.name === "c_user" && !!c.value);
+    if (!loggedIn) {
+      await log(
+        "⚠️ c_user tidak ditemukan — skip export, file session dibiarkan."
+      );
+      return;
+    }
+
+    let cookieSkip = 0;
+    const cookieLines: string[] = [];
+    for (const c of cookies) {
+      if (/[\t\n\r]/.test(c.name) || /[\t\n\r]/.test(c.value)) {
+        cookieSkip++;
+        continue;
+      }
+      const expiry =
+        typeof c.expires === "number" && c.expires > 0
+          ? new Date(c.expires * 1000).toISOString()
+          : "";
+      const sameSite =
+        c.sameSite === "Strict" || c.sameSite === "Lax" || c.sameSite === "None"
+          ? c.sameSite
+          : "-";
+      cookieLines.push(
+        [
+          c.name,
+          c.value,
+          c.domain,
+          c.path,
+          expiry,
+          "-",
+          c.httpOnly ? "✓" : "-",
+          c.secure ? "✓" : "-",
+          sameSite,
+        ].join("\t")
+      );
+    }
+
+    if (cookieLines.length > 0) {
+      await fs.writeFile(COOKIE_FILE, cookieLines.join("\n") + "\n", "utf-8");
+      await log(
+        `💾 cookie.txt di-refresh dari session live (${cookieLines.length} cookies)` +
+          (cookieSkip ? `, ${cookieSkip} dilewati (ada tab/newline)` : "")
+      );
+    } else {
+      await log("⚠️ Tidak ada cookie untuk di-export — cookie.txt dibiarkan.");
+    }
+
+    const items = await page.evaluate(() =>
+      Object.entries(localStorage).map(([key, value]) => ({ key, value: String(value) }))
+    );
+    let lsSkip = 0;
+    const lsLines: string[] = [];
+    for (const { key, value } of items) {
+      if (!key || /[\t\n\r]/.test(key) || /[\t\n\r]/.test(value)) {
+        lsSkip++;
+        continue;
+      }
+      lsLines.push(`${key}\t${value}`);
+    }
+    if (lsLines.length > 0) {
+      await fs.writeFile(
+        LOCALSTORAGE_FILE,
+        lsLines.join("\n") + "\n",
+        "utf-8"
+      );
+      await log(
+        `💾 localstorage.txt di-refresh dari session live (${lsLines.length} items)` +
+          (lsSkip ? `, ${lsSkip} dilewati` : "")
+      );
+    } else {
+      await log("⚠️ localStorage kosong — localstorage.txt dibiarkan.");
+    }
+  } catch (err) {
+    await log(`⚠️ Gagal export session files (tidak fatal): ${err}`);
+  }
+}
+
+// ─── Sesi: PROFIL DULU, file hanya bootstrap ─────────────────────────────────
+// - Profil login      → file tidak disentuh (cookie valid tidak dihalangi)
+//                       + file di-refresh dari session live
+// - Profil kosong     → inject file → login via file
+// - Masih belum login → login manual 10 menit
+// Tujuan: sesi tahan selama FB mengizinkan, tidak fasih kena logout oleh
+// injeksi berulang (penyebab utama "harus masukin cookies terus-terusan").
+async function ensureSessionReady(page: Page): Promise<void> {
+  if (!(await checkNeedsLogin(page))) {
+    await log("✅ Session Facebook tersedia di persistent browser profile");
+    await exportSessionFiles(page);
+    return;
+  }
+
+  await log("⚠️ FB account belum login pada browser profile ini.");
+  await log("🔁 Bootstrap session dari cookie.txt / localstorage.txt...");
+  await loadCookieAndLocalStorage(page);
+
+  if (!(await checkNeedsLogin(page))) {
+    await log("✅ Login berhasil via file session.");
+    await exportSessionFiles(page);
+    return;
+  }
+
+  // Auto-login (opsional): hanya kalau creds.json tersedia untuk akun ini.
+  // Gagal (checkpoint/salah password/form aneh) → jatuh ke login manual.
+  const creds = await loadCreds();
+  if (creds && (await tryAutoLogin(page, creds))) {
+    await log("✅ Auto-login sukses via creds.json.");
+    await exportSessionFiles(page);
+    return;
+  }
+
+  await ensureFacebookLoggedIn(page);
+  await exportSessionFiles(page);
+}
+
+// Baca kredensial opsional accounts/<id>/creds.json (plaintext, dibuat manual
+// oleh user). Tanpa file / JSON rusak / field kosong → null (perilaku lama).
+async function loadCreds(): Promise<{ email: string; password: string } | null> {
+  try {
+    const raw = await fs.readFile(path.join(ACCOUNT_DIR, "creds.json"), "utf-8");
+    const parsed = parseJsonSafe<{ email?: string; password?: string }>(raw);
+    if (parsed?.email && parsed?.password) {
+      return { email: parsed.email, password: parsed.password };
+    }
+    await log("⚠️ creds.json tidak lengkap (butuh email & password) — dilewati.");
+  } catch {
+    // File tidak ada → normal, auto-login tidak diaktifkan untuk akun ini.
+  }
+  return null;
+}
+
+// Isi form login Facebook otomatis. true = login sukses (c_user muncul).
+// Selalu aman-gagal: checkpoint / salah password / error → false → fallback
+// ke jendela login manual yang sudah ada.
+async function tryAutoLogin(
+  page: Page,
+  creds: { email: string; password: string }
+): Promise<boolean> {
+  try {
+    await log("🤖 Auto-login dari creds.json...");
+    await page.goto("https://web.facebook.com/login", {
+      waitUntil: "domcontentloaded",
+      timeout: NAV_TIMEOUT,
+    });
+    await randomDelay(2000, 3000);
+
+    const emailInput = await page.waitForSelector('input[name="email"]', {
+      timeout: 10000,
+    });
+    if (!emailInput) {
+      await log("⚠️ Form login tidak ditemukan — auto-login dibatalkan.");
+      return false;
+    }
+    // focus() lebih aman daripada click() — elemen kadang tertutup overlay
+    // (banner cookie-consent dsb) sehingga click() gagal "not clickable".
+    await emailInput.focus();
+    await emailInput.type(creds.email, { delay: randomBetween(40, 110) });
+    await randomDelay(500, 1200);
+
+    const passInput = await page.waitForSelector('input[name="pass"]', {
+      timeout: 10000,
+    });
+    if (!passInput) {
+      await log("⚠️ Input password tidak ditemukan — auto-login dibatalkan.");
+      return false;
+    }
+    await passInput.focus();
+    await passInput.type(creds.password, { delay: randomBetween(40, 110) });
+    await randomDelay(500, 1200);
+
+    // Tombol submit: button[name="login"] (varian umum), fallback
+    // button[type="submit"] & input[type="submit"] (varian lama).
+    const submit: ElementHandle<Element> | null =
+      (await page.$('button[name="login"]')) ||
+      (await page.$('button[type="submit"]')) ||
+      (await page.$('input[type="submit"]'));
+    if (!submit) {
+      await log("⚠️ Tombol login tidak ditemukan — auto-login dibatalkan.");
+      return false;
+    }
+    try {
+      await submit.click();
+    } catch {
+      // Elemen tertutup overlay / di luar viewport → klik via DOM langsung.
+      await submit.evaluate((el) => (el as HTMLElement).click());
+    }
+
+    // Tunggu proses login selesai (navigasi + verifikasi c_user).
+    // Jangan bail saat form masih terlihat: FB menampilkan form + spinner
+    // selama submit (bisa >10 detik). Form yang masih ada hanya dianggap
+    // "password salah" setelah deadline habis.
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      await randomDelay(2000, 3000);
+      const url = page.url().toLowerCase();
+      if (
+        url.includes("checkpoint") ||
+        url.includes("two_step_verification") ||
+        url.includes("login/approval")
+      ) {
+        await log(
+          "⚠️ Facebook minta checkpoint/2FA setelah auto-login — butuh sentuhan manusia."
+        );
+        return false;
+      }
+      const cookies = await page.cookies(
+        "https://web.facebook.com",
+        "https://www.facebook.com"
+      );
+      if (cookies.some((c) => c.name === "c_user" && !!c.value)) {
+        return true;
+      }
+      // FB menampilkan pesan ini tanpa mengubah URL — deteksi langsung supaya
+      // log tidak menyesatkan ("timeout" padahal password salah).
+      const wrongPassword = await page
+        .evaluate(() =>
+          /password you entered is incorrect|kata sandi yang anda masukkan salah/i.test(
+            document.body.innerText
+          )
+        )
+        .catch(() => false);
+      if (wrongPassword) {
+        await log(
+          "❌ Password ditolak Facebook (creds.json salah) — perlu login manual."
+        );
+        return false;
+      }
+    }
+
+    const stillForm = await page
+      .evaluate(
+        () =>
+          !!(
+            document.querySelector('input[name="email"]') ||
+            document.querySelector('input[name="pass"]')
+          )
+      )
+      .catch(() => false);
+    if (stillForm) {
+      await log("⚠️ Form login masih tampil (kemungkinan email/password salah).");
+      try {
+        await page.screenshot({
+          path: path.join(ACCOUNT_DIR, "debug-autologin.png"),
+        });
+        await log("📸 Screenshot state login disimpan: debug-autologin.png");
+      } catch {}
+      return false;
+    }
+
+    await log("⚠️ Timeout menunggu hasil auto-login.");
+    return false;
+  } catch (err) {
+    await log(`⚠️ Auto-login gagal: ${err}`);
+    return false;
+  }
+}
+
+// Tunggu cookie c_user benar-benar turun. Setelah login FB kadang telat
+// men-set cookie; export yang jalan terlalu cepat akan di-skip guard c_user
+// dan sesi tidak tersimpan ke file bootstrap.
+async function waitForCuser(page: Page, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const cookies = await page
+      .cookies("https://web.facebook.com", "https://www.facebook.com")
+      .catch(() => [] as Awaited<ReturnType<Page["cookies"]>>);
+    if (cookies.some((c) => c.name === "c_user" && !!c.value)) return true;
+    if (Date.now() >= deadline) return false;
+    await randomDelay(1500, 2000);
+  }
+}
+
 // ─── Facebook Session Check ─────────────────────────────────────────────────
 async function ensureFacebookLoggedIn(page: Page): Promise<void> {
   await log("🔐 Mengecek session Facebook...");
@@ -377,7 +773,7 @@ async function ensureFacebookLoggedIn(page: Page): Promise<void> {
     return hasLoginUrl || hasLoginForm;
   });
 
-  if (!needsLogin) {
+  if (!needsLogin && (await waitForCuser(page, 5000))) {
     await log("✅ Session Facebook tersedia di persistent browser profile");
     return;
   }
@@ -389,6 +785,12 @@ async function ensureFacebookLoggedIn(page: Page): Promise<void> {
 
   const deadline = Date.now() + 10 * 60 * 1000;
   while (Date.now() < deadline) {
+    // stop.request dicek juga saat menunggu login manual, supaya STOP admin
+    // tetap dihormati dan worker keluar rapi (bukan terpaksa-kill 30 detik).
+    if (await waitWithStopCheck(3500)) {
+      await log("⏹ STOP diminta saat menunggu login → keluar rapi.");
+      process.exit(0);
+    }
     await randomDelay(3000, 5000);
 
     const loggedIn = await page.evaluate(() => {
@@ -401,9 +803,18 @@ async function ensureFacebookLoggedIn(page: Page): Promise<void> {
     });
 
     if (loggedIn) {
-      await log(
-        "✅ Login Facebook terdeteksi. Session akan dipertahankan oleh persistent profile."
-      );
+      // Cookie kadang belum settle saat form hilang. Tunggu c_user dulu supaya
+      // exportSessionFiles() tidak di-skip dan file bootstrap ikut ter-refresh.
+      await randomDelay(3000, 5000);
+      if (await waitForCuser(page, 15000)) {
+        await log(
+          "✅ Login Facebook terdeteksi (c_user ada). Session akan dipertahankan oleh persistent profile."
+        );
+      } else {
+        await log(
+          "⚠️ Login terdeteksi tetapi cookie c_user belum turun — export file session akan di-skip."
+        );
+      }
       return;
     }
   }
@@ -431,6 +842,27 @@ function setupPageListeners(page: Page): void {
   });
 }
 
+// ─── esbuild/tsx `__name` shim ────────────────────────────────────────────────
+// tsx (esbuild) kadang menyisipkan pemanggilan helper internal `__name(fn, "namaFn")`
+// saat mentranspile arrow function yang di-assign ke const (misalnya `const normalize = ...`).
+// Helper itu hanya ada di scope Node.js. Tapi page.evaluate() mengirim ulang isi fungsi
+// sebagai string murni ke context browser, sehingga saat dieksekusi di sana
+// `__name` tidak dikenal → "ReferenceError: __name is not defined" dan fungsi yang
+// memanggilnya (mis. detectFacebookPostingRestriction) gagal total.
+// Polyfill ini disuntik ke SETIAP dokumen baru pada page tsb (via evaluateOnNewDocument),
+// jadi `window.__name` selalu ada sebelum script lain berjalan, apa pun penyebab
+// persisnya. Aman dipanggil berkali-kali.
+async function ensureNameShim(page: Page): Promise<void> {
+  try {
+    await page.evaluateOnNewDocument(() => {
+      (window as any).__name =
+        (window as any).__name || ((fn: any) => fn);
+    });
+  } catch {
+    // Jika page sudah tertutup dsb, abaikan — bukan fatal.
+  }
+}
+
 // ─── Safe Navigation ──────────────────────────────────────────────────────────
 async function safeGoto(
   browser: Browser,
@@ -450,6 +882,7 @@ async function safeGoto(
       page = await browser.newPage();
       await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
       setupPageListeners(page);
+      await ensureNameShim(page);
       const context = browser.defaultBrowserContext();
       await context.overridePermissions("https://www.facebook.com", [
         "clipboard-read",
@@ -518,10 +951,124 @@ const LIMITED_KEYWORDS = [
   "we restrict certain activity", "posting limit", "dibatasi sementara",
   "posting dibatasi", "akun dibatasi", "aktivitas dibatasi",
   "tindakan diblokir",
+
+  // Pesan pembatasan frekuensi posting Facebook (Indonesia/Inggris).
+  "kami membatasi seberapa sering anda dapat memposting",
+  "kami membatasi seberapa sering anda dapat memposting, berkomentar",
+  "kami membatasi seberapa sering anda dapat memposting, berkomentar, atau melakukan hal-hal lain",
+  "we limit how often you can post",
+  "we limit how often you can post, comment",
 ];
 
 function normalizeUiText(text: string): string {
   return text.toLowerCase().replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+}
+
+async function detectFacebookPostingRestriction(
+  page: Page,
+  groupLabel: string
+): Promise<boolean> {
+  try {
+    const result = await page.evaluate(() => {
+      const normalize = (value: string) =>
+        value
+          .toLowerCase()
+          .replace(/\u00a0/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+
+      const restrictionPhrases = [
+        "kami membatasi seberapa sering anda dapat memposting",
+        "kami membatasi seberapa sering anda dapat memposting, berkomentar",
+        "we limit how often you can post",
+      ];
+
+      const bodyText = normalize(document.body?.innerText || "");
+      const phraseFound = restrictionPhrases.some((phrase) =>
+        bodyText.includes(phrase)
+      );
+
+      // Cari elemen teks yang benar-benar dirender berwarna merah.
+      // Warna merah dipakai sebagai penguat deteksi, bukan satu-satunya syarat,
+      // karena Facebook dapat mengubah class/CSS sewaktu-waktu.
+      let redTextFound = false;
+      const elements = Array.from(
+        document.querySelectorAll("body *")
+      );
+
+      for (const el of elements) {
+        const text = normalize(el.textContent || "");
+        if (!text || text.length > 500) continue;
+
+        const style = window.getComputedStyle(el);
+        const color = style.color;
+
+        const match = color.match(
+          /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*[\d.]+)?\s*\)/
+        );
+
+        if (!match) continue;
+
+        const r = Number(match[1]);
+        const g = Number(match[2]);
+        const b = Number(match[3]);
+
+        // Merah dominan, cukup longgar untuk variasi merah Facebook.
+        const isRed = r >= 180 && r > g * 1.45 && r > b * 1.45;
+
+        if (
+          isRed &&
+          restrictionPhrases.some((phrase) => text.includes(phrase))
+        ) {
+          redTextFound = true;
+          break;
+        }
+      }
+
+      return {
+        phraseFound,
+        redTextFound,
+        detected: phraseFound || redTextFound,
+      };
+    });
+
+    if (result.detected) {
+      await log(
+        `🚨 ${groupLabel} → SPAM/POSTING RESTRICTION FACEBOOK TERDETEKSI ` +
+        `(phrase=${result.phraseFound}, redText=${result.redTextFound})`
+      );
+      return true;
+    }
+  } catch (error) {
+    await log(
+      `⚠️ ${groupLabel} → gagal mengecek posting restriction: ${error}`
+    );
+  }
+
+  return false;
+}
+
+async function detectLimitOnly(page: Page, groupLabel: string): Promise<boolean> {
+  // Deteksi pesan spesifik "Kami membatasi seberapa sering..." terlebih dahulu.
+  if (await detectFacebookPostingRestriction(page, groupLabel)) {
+    return true;
+  }
+
+  try {
+    const uiText = normalizeUiText(
+      await page.evaluate(() => document.body?.innerText || "")
+    );
+
+    const limited = LIMITED_KEYWORDS.find((k) => uiText.includes(k));
+    if (limited) {
+      await log(`🚨 ${groupLabel} → LIMIT terdeteksi: "${limited}"`);
+      return true;
+    }
+  } catch (error) {
+    await log(`⚠️ ${groupLabel} → gagal mengecek limit: ${error}`);
+  }
+
+  return false;
 }
 
 async function detectPostingResult(
@@ -585,8 +1132,8 @@ async function detectPostingResult(
 async function loadPostingStats(): Promise<PostingStats> {
   try {
     const raw = await fs.readFile(POSTING_STATS_FILE, "utf-8");
-    const stats = JSON.parse(raw) as PostingStats;
-    if (stats.accountId === ACCOUNT_ID) return stats;
+    const stats = parseJsonSafe<PostingStats>(raw);
+    if (stats && stats.accountId === ACCOUNT_ID) return stats;
   } catch {}
   return { accountId: ACCOUNT_ID, total: 0, direct: 0, pending: 0, error: 0, limited: 0, unknown: 0, lastUpdated: new Date().toISOString() };
 }
@@ -597,6 +1144,8 @@ async function savePostingStats(stats: PostingStats): Promise<void> {
 }
 
 async function resetPostingStats(): Promise<void> {
+  // Lifetime di-reset ke 0, tetapi RIWAYAT HARIAN dipertahankan.
+  const previous = await loadPostingStats();
   const stats: PostingStats = {
     accountId: ACCOUNT_ID,
     total: 0,
@@ -606,8 +1155,27 @@ async function resetPostingStats(): Promise<void> {
     limited: 0,
     unknown: 0,
     lastUpdated: new Date().toISOString(),
+    daily: previous.daily ?? {},
   };
   await savePostingStats(stats);
+}
+
+// Tanggal lokal hari ini dalam "YYYY-MM-DD" (mengikuti zona waktu komputer).
+function todayLocal(): string {
+  return new Date().toLocaleDateString("sv-SE");
+}
+
+function emptyDailyStat(): DailyStat {
+  return { total: 0, direct: 0, pending: 0, error: 0, limited: 0, unknown: 0 };
+}
+
+function incrementDailyStat(d: DailyStat, status: PostingStatus): void {
+  d.total++;
+  if (status === "POSTING_OK") d.direct++;
+  else if (status === "PENDING_APPROVAL") d.pending++;
+  else if (status === "ERROR") d.error++;
+  else if (status === "LIMITED") d.limited++;
+  else d.unknown++;
 }
 
 async function recordPostingResult(status: PostingStatus): Promise<void> {
@@ -618,12 +1186,27 @@ async function recordPostingResult(status: PostingStatus): Promise<void> {
   else if (status === "ERROR") stats.error++;
   else if (status === "LIMITED") stats.limited++;
   else stats.unknown++;
+
+  // Increment bucket harian.
+  if (!stats.daily) stats.daily = {};
+  const day = todayLocal();
+  if (!stats.daily[day]) stats.daily[day] = emptyDailyStat();
+  incrementDailyStat(stats.daily[day], status);
+
+  // Prune bucket harian lebih tua dari 30 hari.
+  const keys = Object.keys(stats.daily).sort();
+  while (keys.length > 30) delete stats.daily[keys.shift() as string];
+
   await savePostingStats(stats);
 }
 
 async function logPostingSummary(): Promise<void> {
   const stats = await loadPostingStats();
-  await log(`📊 RINGKASAN → total=${stats.total} | direct=${stats.direct} | pending=${stats.pending} | error=${stats.error} | limited=${stats.limited} | unknown=${stats.unknown}`);
+  const daily = stats.daily?.[todayLocal()];
+  const todayLine = daily
+    ? ` | hari ini: total=${daily.total} direct=${daily.direct} pending=${daily.pending} error=${daily.error} limited=${daily.limited} unknown=${daily.unknown}`
+    : "";
+  await log(`📊 RINGKASAN → total=${stats.total} | direct=${stats.direct} | pending=${stats.pending} | error=${stats.error} | limited=${stats.limited} | unknown=${stats.unknown}${todayLine}`);
 }
 
 // ─── Post to Single Group ─────────────────────────────────────────────────────
@@ -659,13 +1242,11 @@ async function postToGroup(
   await randomDelay(3000, 5000);
   await log(`🌐 ${groupLabel} → navigated`);
 
-// Fail-safe: cek apakah akun sudah LIMIT sebelum posting
-const prePostStatus = await detectPostingResult(page, groupLabel, "");
-
-if (prePostStatus === "LIMITED") {
-  await log(
-    `🛑 ${groupLabel} → akun terdeteksi LIMIT sebelum posting`
-  );
+// Fail-safe: hanya cek LIMIT.
+// Jangan memakai detectPostingResult("", ...) di sini karena halaman grup
+// bisa mengandung teks/status lama dan menyebabkan false-positive.
+if (await detectLimitOnly(page, groupLabel)) {
+  await log(`🛑 ${groupLabel} → akun terdeteksi LIMIT sebelum posting`);
 
   return {
     page,
@@ -795,9 +1376,18 @@ if (prePostStatus === "LIMITED") {
     await log(`🖼️  ${groupLabel} → upload ${imagePaths.length} gambar...`);
     const fileInput = (
       await page.evaluateHandle(() => {
-        return Array.from(
-          document.querySelectorAll('input[type="file"].x1s85apg')
-        ).find((input) => !input.closest('[aria-hidden="true"]'));
+        const inputs = Array.from(
+          document.querySelectorAll('input[type="file"]')
+        ) as HTMLInputElement[];
+
+        return (
+          inputs.find((input) => {
+            const hiddenAncestor = input.closest('[aria-hidden="true"]');
+            return !hiddenAncestor && !input.disabled;
+          }) ||
+          inputs.find((input) => !input.disabled) ||
+          null
+        );
       })
     ).asElement() as ElementHandle<HTMLInputElement> | null;
 
@@ -823,11 +1413,21 @@ if (prePostStatus === "LIMITED") {
     'div[aria-label="Posting"][role="button"]',
     'div[aria-label="Post"][role="button"]',
     'div[aria-label="Kirim"][role="button"]',
+    'div[aria-label="Publish"][role="button"]',
+    'button[aria-label="Posting"]',
+    'button[aria-label="Post"]',
+    'button[aria-label="Kirim"]',
+    'button[aria-label="Publish"]',
   ];
   const postButtonXPaths = [
-    '//div[@role="button" and .//span[text()="Posting"]]',
-    '//div[@role="button" and .//span[text()="Post"]]',
-    '//div[@role="button" and .//span[text()="Kirim"]]',
+    '//div[@role="button" and .//span[normalize-space()="Posting"]]',
+    '//div[@role="button" and .//span[normalize-space()="Post"]]',
+    '//div[@role="button" and .//span[normalize-space()="Kirim"]]',
+    '//div[@role="button" and .//span[normalize-space()="Publish"]]',
+    '//button[.//span[normalize-space()="Posting"]]',
+    '//button[.//span[normalize-space()="Post"]]',
+    '//button[.//span[normalize-space()="Kirim"]]',
+    '//button[.//span[normalize-space()="Publish"]]',
   ];
 
   let postButton = null;
@@ -851,22 +1451,41 @@ if (prePostStatus === "LIMITED") {
     return { page, success: false };
   }
 
-  // Tunggu tombol tidak disabled (max 15 detik)
+  // Tunggu tombol siap. Cek aria-disabled dan property disabled.
   let isDisabled = true;
   let retries = 0;
-  while (isDisabled && retries < 30) {
-    isDisabled = await page.evaluate(
-      (el) => el?.getAttribute("aria-disabled") === "true",
-      postButton
-    );
+  while (isDisabled && retries < 40) {
+    isDisabled = await page.evaluate((el) => {
+      if (!el) return true;
+
+      const ariaDisabled = el.getAttribute("aria-disabled") === "true";
+      const disabledProperty =
+        "disabled" in el && Boolean((el as any).disabled);
+
+      return ariaDisabled || disabledProperty;
+    }, postButton);
+
     if (isDisabled) {
       await new Promise((r) => setTimeout(r, 500));
       retries++;
     }
   }
 
+  if (isDisabled) {
+    await log(`⚠️ ${groupLabel} → tombol Post tetap disabled setelah menunggu`);
+    return { page, success: false, status: "UNKNOWN" };
+  }
+
   await postButton.click();
   await log(`📤 ${groupLabel} → Post diklik!`);
+
+  // Cek segera apakah Facebook menampilkan peringatan pembatasan posting.
+  // Jika iya, jangan retry grup ini karena retry justru berisiko memperparah limit.
+  await randomDelay(1000, 2000);
+  if (await detectFacebookPostingRestriction(page, groupLabel)) {
+    await recordPostingResult("LIMITED");
+    return { page, success: false, status: "LIMITED" };
+  }
 
   const postStatus = await detectPostingResult(page, groupLabel, postContent);
   await recordPostingResult(postStatus);
@@ -900,7 +1519,8 @@ async function loadAccountConfig(): Promise<AccountConfig> {
   const configPath = path.join(ACCOUNT_DIR, "config.json");
   try {
     const raw = await fs.readFile(configPath, "utf-8");
-    const config = JSON.parse(raw) as AccountConfig;
+    const config = parseJsonSafe<AccountConfig>(raw);
+    if (!config) return { id: ACCOUNT_ID };
     return { ...config, id: ACCOUNT_ID };
   } catch {
     return { id: ACCOUNT_ID };
@@ -974,8 +1594,12 @@ async function main(): Promise<void> {
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--start-maximized",
+      // Anti-automation: hilangkan sinyal "bot" supaya FB lebih jarang
+      // checkpoint/logout yang mematikan sesi.
+      "--disable-blink-features=AutomationControlled",
       "--enable-features=AsyncClipboardAPI",
     ],
+    ignoreDefaultArgs: ["--enable-automation"],
     defaultViewport: null,
   });
 
@@ -993,13 +1617,14 @@ async function main(): Promise<void> {
   ]);
 
   setupPageListeners(page);
+  await ensureNameShim(page);
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+  });
 
-  // Load cookie/localStorage jika tersedia. File tersebut opsional.
-  await loadCookieAndLocalStorage(page);
-
-  // Pastikan account sudah login. Pada first run, login dilakukan manual.
-  await ensureFacebookLoggedIn(page);
+  // Sesi: profil dulu, file hanya bootstrap — sekali login tahan lama.
+  await ensureSessionReady(page);
 
   // ── Kumpulkan semua group links sekali di awal ─────────────────────────────
   await log("📋 Mengumpulkan group links...");
@@ -1099,12 +1724,17 @@ async function main(): Promise<void> {
   await log(`   • Batch: ${startBatch} → ${totalBatches}`);
   await log(`   • Grup per batch: ${groupLinks.length}`);
   await log(`   • Mulai dari group index: ${startGroupIdx}`);
-  await log(`   • Delay antar post: 8–15 detik`);
-  await log(`   • Delay antar batch: 45–90 detik`);
+  await log(`   • Delay antar post: ${(POST_DELAY_MIN_MS / 1000).toFixed(0)}–${(POST_DELAY_MAX_MS / 1000).toFixed(0)} detik`);
+  await log(`   • Retry per grup: maksimal ${MAX_POST_ATTEMPTS} kali`);
+     await log(`   • Delay antar batch: 45–90 detik`);
   await log(`   • Mulai dalam 3 detik...\n`);
   await randomDelay(3000, 3000);
 
   // ── Loop batch utama ───────────────────────────────────────────────────────
+  // Menghitung berapa banyak grup BERTURUT-TURUT yang gagal diposting (bukan LIMIT
+  // terverifikasi). Reset ke 0 setiap kali ada grup yang berhasil.
+  let consecutiveSkips = 0;
+
   for (let batch = startBatch; batch <= totalBatches; batch++) {
     await log(`\n${"═".repeat(50)}`);
     await log(`🗂️  BATCH ${batch}/${totalBatches}`);
@@ -1114,7 +1744,7 @@ async function main(): Promise<void> {
     try {
       content = await loadContentBatch(batch);
     } catch (err) {
-      await log(`❌ Batch ${batch} diskip: ${err}`);
+      await log(`❌ Batch ${batch} tidak dapat diproses karena kontennya tidak tersedia: ${err}`);
       continue;
     }
 
@@ -1136,57 +1766,165 @@ async function main(): Promise<void> {
       await log(`\n${groupLabel} → ${link}`);
 
       try {
-        const result = await postToGroup(
-          browser,
-          page,
-          link,
-          content.postContent,
-          content.imagePaths,
-          groupLabel
-        );
-        page = result.page;
+        let completed = false;
 
-        // Jika Facebook menunjukkan pembatasan, hentikan seluruh proses.
-        if (result.status === "LIMITED") {
-          await log(`\n🛑 STOP: Facebook mendeteksi pembatasan posting.`);
-          await log(`   Batch terakhir: ${batch}`);
-          await log(`   Group terakhir: ${i + 1}`);
-          await log(`   Progress disimpan agar bisa dilanjutkan nanti.`);
+        // Jangan langsung skip jika selector/UI gagal.
+        // Progress hanya maju jika posting mendapat hasil yang terverifikasi.
+        for (let attempt = 1; attempt <= MAX_POST_ATTEMPTS; attempt++) {
+          if (await stopRequested()) {
+            await saveProgress(batch, i);
+            await log(`⏹ STOP diminta → menyimpan progress B${batch} G${i + 1}`);
+            await browser.close();
+            return;
+          }
 
-          // Simpan grup yang sedang diperiksa agar tidak dianggap selesai.
-          await saveProgress(batch, i);
+          await log(`🔁 ${groupLabel} → percobaan ${attempt}/${MAX_POST_ATTEMPTS}`);
 
-          await browser.close();
-          return;
+          // Jangan melakukan retry jika Facebook sudah memberi restriction.
+          if (await detectFacebookPostingRestriction(page, groupLabel)) {
+            await log(
+              `🛑 ${groupLabel} → proses dihentikan sebelum retry karena Facebook membatasi aktivitas posting.`
+            );
+            await saveProgress(batch, i);
+            await browser.close();
+            return;
+          }
+
+          try {
+            const result = await postToGroup(
+              browser,
+              page,
+              link,
+              content.postContent,
+              content.imagePaths,
+              groupLabel
+            );
+            page = result.page;
+
+            if (result.status === "LIMITED") {
+              await log(`\n🛑 STOP: Facebook mendeteksi pembatasan posting.`);
+              await log(`   Batch terakhir: ${batch}`);
+              await log(`   Group terakhir: ${i + 1}`);
+              await log(`   Progress disimpan agar bisa dilanjutkan nanti.`);
+              await saveProgress(batch, i);
+              await browser.close();
+              return;
+            }
+
+            if (
+              result.status === "POSTING_OK" ||
+              result.status === "PENDING_APPROVAL"
+            ) {
+              completed = true;
+              consecutiveSkips = 0; // grup berhasil → reset penghitung skip berturut-turut
+              await saveProgress(batch, i + 1);
+              await log(`💾 Progress: batch=${batch}, nextGroup=${i + 2}`);
+              await logPostingSummary();
+              break;
+            }
+
+            // ERROR/UNKNOWN tidak dianggap selesai.
+            // Grup yang sama dicoba ulang agar tidak terlewat.
+            await log(
+              `⚠️ ${groupLabel} → status ${result.status || "UNKNOWN"}, ` +
+              `belum dianggap selesai.`
+            );
+
+            if (attempt < MAX_POST_ATTEMPTS) {
+              const retryDelay = randomBetween(10000, 20000);
+              await log(
+                `⏳ ${groupLabel} → retry dalam ${(retryDelay / 1000).toFixed(1)}s...`
+              );
+
+              if (await waitWithStopCheck(retryDelay)) {
+                await saveProgress(batch, i);
+                await log(`⏹ STOP diminta → progress disimpan di B${batch} G${i + 1}`);
+                await browser.close();
+                return;
+              }
+            }
+          } catch (err) {
+            await log(`❌ ${groupLabel} → percobaan ${attempt} gagal: ${err}`);
+
+            if (attempt < MAX_POST_ATTEMPTS) {
+              const retryDelay = randomBetween(10000, 20000);
+              await log(
+                `⏳ ${groupLabel} → retry dalam ${(retryDelay / 1000).toFixed(1)}s...`
+              );
+
+              if (await waitWithStopCheck(retryDelay)) {
+                await saveProgress(batch, i);
+                await log(`⏹ STOP diminta → progress disimpan di B${batch} G${i + 1}`);
+                await browser.close();
+                return;
+              }
+            }
+          }
         }
 
-        if (
-          result.status === "POSTING_OK" ||
-          result.status === "PENDING_APPROVAL" ||
-          result.status === "ERROR"
-        ) {
-          // Hasil sudah diketahui, jadi grup dianggap selesai diproses.
+        if (!completed) {
+          // Grup ini benar-benar gagal (ERROR/UNKNOWN) setelah semua percobaan,
+          // dan itu BUKAN karena LIMIT terverifikasi (LIMITED sudah return lebih awal di atas).
+          // Sesuai kebutuhan: kalau memang tidak bisa post di grup ini, LANJUT KE GRUP
+          // BERIKUTNYA — tapi JANGAN loncat ke batch berikutnya. Progress disimpan
+          // sebagai i+1 (grup ini dilewati), dan for-loop di bawah secara alami tetap
+          // berada di batch yang sama sampai semua grup di batch ini diproses.
+          consecutiveSkips++;
           await saveProgress(batch, i + 1);
-          await log(`💾 Progress: batch=${batch}, nextGroup=${i + 2}`);
-          await logPostingSummary();
+          await log(
+            `⏭️ ${groupLabel} → GAGAL setelah ${MAX_POST_ATTEMPTS} percobaan (bukan limit). ` +
+            `Grup ini DI-SKIP (${consecutiveSkips} gagal berturut-turut), lanjut ke grup berikutnya ` +
+            `— batch ${batch} TIDAK dilanjutkan ke batch berikutnya sebelum semua grup selesai.`
+          );
 
-          const delay = randomBetween(8000, 15000);
-          await log(`⏱️  Menunggu ${(delay / 1000).toFixed(1)}s...`);
-          if (await waitWithStopCheck(delay)) {
-            await saveProgress(batch, i + 1);
+          if (
+            MAX_CONSECUTIVE_SKIPS > 0 &&
+            consecutiveSkips >= MAX_CONSECUTIVE_SKIPS
+          ) {
+            await log(
+              `🛑 STOP: ${consecutiveSkips} grup berturut-turut gagal diposting. ` +
+              `Ini bisa jadi tanda limit yang tidak terdeteksi otomatis, jadi worker ` +
+              `dihentikan sebagai safety-net. Progress tersimpan di B${batch} G${i + 2}. ` +
+              `Cek akun secara manual sebelum resume (atau naikkan MAX_CONSECUTIVE_SKIPS).`
+            );
+            await browser.close();
+            return;
+          }
+
+          const skipDelay = randomBetween(10000, 20000);
+          await log(
+            `⏳ Jeda ${(skipDelay / 1000).toFixed(1)}s sebelum lanjut ke grup berikutnya...`
+          );
+          if (await waitWithStopCheck(skipDelay)) {
             await log(`⏹ STOP diminta → progress disimpan di B${batch} G${i + 2}`);
             await browser.close();
             return;
           }
-        } else {
-          // UNKNOWN: jangan menganggap grup sudah selesai.
-          await log(`⚠️ ${groupLabel} → status UNKNOWN, grup tidak ditandai sebagai selesai`);
-          await saveProgress(batch, i);
+
+          continue; // lanjut ke grup berikutnya DI BATCH YANG SAMA
+        }
+
+        // Delay antar posting yang sudah berhasil diproses.
+        const delay = randomBetween(POST_DELAY_MIN_MS, POST_DELAY_MAX_MS);
+        await log(
+          `⏱️ Delay antar posting: ${(delay / 1000).toFixed(1)}s...`
+        );
+
+        if (await waitWithStopCheck(delay)) {
+          await saveProgress(batch, i + 1);
+          await log(`⏹ STOP diminta → progress disimpan di B${batch} G${i + 2}`);
+          await browser.close();
+          return;
         }
       } catch (err) {
+        // Error tak terduga juga TIDAK memajukan progress.
         await log(`❌ ${groupLabel} → Error tidak terduga: ${err}`);
-        await log(`   Lanjut ke grup berikutnya...`);
-        await saveProgress(batch, i + 1);
+        await saveProgress(batch, i);
+        await log(
+          `⏸️ ${groupLabel} → progress tetap di grup ini agar tidak ter-skip.`
+        );
+        await browser.close();
+        return;
       }
     }
 
