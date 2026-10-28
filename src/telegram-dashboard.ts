@@ -22,6 +22,9 @@ if (!ADMIN_IDS.size) throw new Error("TELEGRAM_ADMIN_IDS belum di-set di .env");
 
 const bot = new Telegraf(BOT_TOKEN);
 const workers = new Map<string, ChildProcess>();
+// Mode worker yang berjalan: "" = auto-poster, "collect"/"join" = grup.
+// Mode collect/join tidak boleh di-auto-restart saat exit.
+const workerModes = new Map<string, string>();
 // Akun yang sedang dihentikan secara sengaja lewat tombol/perintah STOP.
 // Dipakai supaya notifikasi "worker berhenti" tidak salah label jadi "tak terduga".
 const manualStops = new Set<string>();
@@ -216,29 +219,51 @@ async function accounts(): Promise<string[]> {
   }
 }
 
-async function lastLog(id: string): Promise<string> {
+const LIMIT_RE =
+  /LIMIT terdeteksi:\s*"([^"]+)"|STOP: Facebook mendeteksi pembatasan posting|akun terdeteksi LIMIT|proses dihentikan karena LIMIT/i;
+
+async function readLogInfo(id: string): Promise<{ last: string; sessionText: string }> {
   try {
     const text = await fs.readFile(path.join(ACCOUNTS_DIR, id, "log.txt"), "utf8");
-    return text.trim().split(/\r?\n/).at(-1) ?? "";
+    const lines = text.trim().split(/\r?\n/);
+    let start = 0;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (/Mulai dalam 3 detik/.test(lines[i])) {
+        start = i + 1;
+        break;
+      }
+    }
+    return {
+      last: lines.at(-1) ?? "",
+      sessionText: lines.slice(start).join("\n"),
+    };
   } catch {
-    return "";
+    return { last: "", sessionText: "" };
   }
+}
+
+function detectLimit(sessionText: string): string | null {
+  const match = sessionText.match(LIMIT_RE);
+  if (!match) return null;
+  return match[1] ?? "pembatasan posting dari Facebook";
 }
 
 async function statusOf(id: string) {
   const running = workers.has(id);
-  const [progress, config, log, stats, runtime] = await Promise.all([
+  const [progress, config, logInfo, stats, runtime] = await Promise.all([
     readJson<Progress>(path.join(ACCOUNTS_DIR, id, "progress.json")),
     readJson<Config>(path.join(ACCOUNTS_DIR, id, "config.json")),
-    lastLog(id),
+    readLogInfo(id),
     readJson<PostingStats>(path.join(ACCOUNTS_DIR, id, "posting-stats.json")),
     readRuntime(id),
   ]);
+  const log = logInfo.last;
+  const limitReason = detectLimit(logInfo.sessionText);
 
   let icon = running ? "🟢" : "🔴";
   let state = running ? "RUNNING" : "STOPPED";
 
-  if (!running && /temporarily blocked|restricted|action blocked|posting limit|limit posting|dibatasi|diblokir|pembatasan posting/i.test(log)) {
+  if (limitReason) {
     icon = "🚫";
     state = "LIMIT / BLOCKED";
   } else if (!running && /semua batch selesai/i.test(log)) {
@@ -273,6 +298,7 @@ async function statusOf(id: string) {
     state,
     position,
     log,
+    limitReason,
     running,
     sessionMs,
     postsTotal: stats?.total ?? 0,
@@ -353,11 +379,12 @@ async function dashboardText(page: number): Promise<string> {
     const dur = a.running ? `⏱ ${fmtDuration(a.sessionMs)}` : "⏱ —";
     const today = a.postsToday ? ` • ${a.postsToday.total} hari ini` : "";
     lines.push(`   ${dur} • 📤 ${a.postsTotal} post${today}`);
+    if (a.limitReason) lines.push(`   🚫 ${esc(a.limitReason)}`);
   }
 
   lines.push(
     "",
-    "🟢 Running  •  🔴 Stopped  •  🚫 Limit/Blocked  •  🔵 Completed",
+    "🟢 Running  •  🔴 Stopped  •  🚫 Limit/Blocked (sesi terakhir)  •  🔵 Completed",
     "⏱️ Status otomatis diperbarui setiap 15 menit."
   );
 
@@ -435,11 +462,19 @@ async function handleWorkerExit(id: string, exitInfo: string): Promise<void> {
 
   const wasManual = manualStops.delete(id);
   const wasSupervised = supervisedRestart.delete(id);
+  const workerMode = workerModes.get(id) ?? "";
+  workerModes.delete(id);
 
   let icon = "⚠️";
   let reason = `Berhenti tak terduga (${exitInfo}). Cek log untuk detail.`;
 
-  if (data.state === "LIMIT / BLOCKED") {
+  if (workerMode === "join") {
+    icon = "➕";
+    reason = "Sesi join grup selesai (detail di join-progress.json).";
+  } else if (workerMode === "collect") {
+    icon = "🧲";
+    reason = "Sesi kumpul grup selesai (hasil di groups-pool.txt).";
+  } else if (data.state === "LIMIT / BLOCKED") {
     icon = "🚫";
     reason = "Terkena limit / pembatasan posting dari Facebook.";
   } else if (data.state === "COMPLETED") {
@@ -478,6 +513,8 @@ async function handleWorkerExit(id: string, exitInfo: string): Promise<void> {
   // Tidak restart bila: shutdown, dihentikan manual, LIMIT, COMPLETED, atau
   // SETUP ERROR (bukan crash — restart tidak akan memperbaiki setup).
   if (shutdownStarted || wasManual) return;
+  // collect/join bukan proses posting — jangan pernah auto-restart.
+  if (workerMode) return;
   if (
     data.state === "LIMIT / BLOCKED" ||
     data.state === "COMPLETED" ||
@@ -516,12 +553,12 @@ async function handleWorkerExit(id: string, exitInfo: string): Promise<void> {
   );
 }
 
-async function startWorker(id: string, resetFailures = true): Promise<string> {
+async function startWorker(id: string, resetFailures = true, mode = ""): Promise<string> {
   // Bagian sinkron sebelum await — menutup race START cepat berulang.
   if (starting.has(id) || workers.has(id)) return `⚠️ ${id} sudah berjalan.`;
   starting.add(id);
   try {
-    return await startWorkerInner(id, resetFailures);
+    return await startWorkerInner(id, resetFailures, mode);
   } finally {
     starting.delete(id);
   }
@@ -529,7 +566,8 @@ async function startWorker(id: string, resetFailures = true): Promise<string> {
 
 async function startWorkerInner(
   id: string,
-  resetFailures: boolean
+  resetFailures: boolean,
+  mode = ""
 ): Promise<string> {
   cancelScheduledRestart(id, false); // restart terjadwal: hitungan kegagalan tetap
   if (resetFailures) failCount.delete(id); // start manual = siklus baru
@@ -543,14 +581,19 @@ async function startWorkerInner(
     return `❌ Worker/dependency untuk ${id} tidak ditemukan.`;
   }
 
-  const child = spawn(process.execPath, [TSX_CLI, WORKER_SCRIPT, id], {
-    cwd: ROOT_DIR,
-    env: { ...process.env, DASHBOARD_MODE: "1" },
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-  });
+  const child = spawn(
+    process.execPath,
+    [TSX_CLI, WORKER_SCRIPT, id, ...(mode ? [mode] : [])],
+    {
+      cwd: ROOT_DIR,
+      env: { ...process.env, DASHBOARD_MODE: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    }
+  );
 
   workers.set(id, child);
+  workerModes.set(id, mode);
   exitHandled.delete(id);
 
   // Catat sesi: waktu mulai + snapshot total posting (untuk hitungan
@@ -581,7 +624,11 @@ async function startWorkerInner(
     void handleWorkerExit(id, `code=${code}, signal=${signal ?? "-"}`);
   });
 
-  return `▶️ ${id} dimulai. Resume otomatis dari progress terakhir.`;
+  return mode === "join"
+    ? `➕ ${id}: mulai join grup dari groups-pool.txt (progress tersimpan di join-progress.json).`
+    : mode === "collect"
+      ? `🧲 ${id}: mulai kumpulkan grup ke groups-pool.txt.`
+      : `▶️ ${id} dimulai. Resume otomatis dari progress terakhir.`;
 }
 
 function isProcessAlive(child: ChildProcess): boolean {
@@ -693,6 +740,24 @@ bot.command("status", async (ctx) => {
   await replyDashboard(ctx, periodicPageByChat.get(ctx.chat?.id ?? 0) ?? 0);
 });
 
+// Mode grup: /collect <akun> mengumpulkan grup yang sudah di-join akun itu ke
+// groups-pool.txt; /join <akun> join grup dari file pool tersebut.
+async function startGroupMode(ctx: Context, mode: "collect" | "join"): Promise<void> {
+  if (!auth(ctx)) return void ctx.reply("⛔ Akses ditolak.");
+  const text =
+    "text" in (ctx.message ?? {})
+      ? String((ctx.message as { text?: string }).text ?? "")
+      : "";
+  const id = text.trim().split(/\s+/)[1] ?? "";
+  if (!id) return void ctx.reply(`Format: /${mode} <akun>\nContoh: /${mode} fb11`);
+  const ids = await accounts();
+  if (!ids.includes(id)) return void ctx.reply(`❌ Akun ${id} tidak ditemukan di accounts/.`);
+  await ctx.reply(await startWorker(id, true, mode));
+}
+
+bot.command("collect", (ctx) => startGroupMode(ctx, "collect"));
+bot.command("join", (ctx) => startGroupMode(ctx, "join"));
+
 bot.action("noop", async (ctx) => {
   if (!auth(ctx)) return void ctx.answerCbQuery("Akses ditolak", { show_alert: true });
   await ctx.answerCbQuery();
@@ -720,6 +785,9 @@ bot.action(/^view:(.+)$/, async (ctx) => {
   const lines = [
     `📱 <b>${esc(data.id)}</b> — ${esc(data.state)}`,
     `Progress: ${esc(data.position)}`,
+    data.limitReason
+      ? `Limit: 🚫 YA — "${esc(data.limitReason)}" (sesi terakhir)`
+      : `Limit: ✅ TIDAK`,
     `Sesi: ${data.running ? `▶ berjalan ${fmtDuration(data.sessionMs)}` : "—"}`,
     `Hari ini: 📤 ${
       d ? d.total : 0
@@ -811,12 +879,14 @@ async function dailySummaryText(): Promise<string> {
 
   let totalAll = 0, directAll = 0, pendingAll = 0, limitedAll = 0, errorAll = 0, unknownAll = 0, msAll = 0;
   let runningCount = 0;
+  let limitCount = 0;
 
   for (const { data } of list) {
     const d = data.postsToday;
     const posts = d?.total ?? 0;
     const ms = runtimeTodayMs(data.runtime, now);
     if (data.running) runningCount++;
+    if (data.state === "LIMIT / BLOCKED") limitCount++;
 
     const breakdown = d
       ? ` (✅${d.direct}${d.pending ? ` 🟡${d.pending}` : ""}${d.limited ? ` 🚫${d.limited}` : ""}${d.error ? ` ❌${d.error}` : ""}${d.unknown ? ` ❓${d.unknown}` : ""})`
@@ -847,7 +917,7 @@ async function dailySummaryText(): Promise<string> {
   lines.push(
     "━━━━━━━━━━━━━━━━━━━━",
     `TOTAL: 📤 ${totalAll} post${totalBreakdown ? ` (${totalBreakdown})` : ""} • ⏱ ${fmtDuration(msAll)}`,
-    `🟢 ${runningCount}/${list.length} akun masih berjalan`
+    `🟢 ${runningCount}/${list.length} akun masih berjalan${limitCount ? ` • 🚫 ${limitCount} akun limit` : ""}`
   );
 
   return lines.join("\n");

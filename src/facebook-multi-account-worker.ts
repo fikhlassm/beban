@@ -46,10 +46,14 @@ const ROOT_DIR = path.resolve("accounts");
 const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".gif", ".webp"];
 
 const ACCOUNT_ID = (process.argv[2] || process.env.ACCOUNT_ID || "").trim();
+// Mode: "collect" = kumpulkan grup yang sudah di-join akun ini ke groups-pool.txt,
+// "join" = join grup dari groups-pool.txt. Kosong = auto-poster biasa.
 const RUN_MODE = (process.argv[3] || process.env.RUN_MODE || "").trim();
 const RUN_BATCH = Number(process.argv[4] || process.env.RUN_BATCH || "0");
 const RUN_GROUP = Number(process.argv[5] || process.env.RUN_GROUP || "0");
 const DASHBOARD_MODE = process.env.DASHBOARD_MODE === "1" || RUN_MODE !== "";
+const COLLECT_MODE = RUN_MODE === "collect";
+const JOIN_MODE = RUN_MODE === "join";
 
 if (!ACCOUNT_ID) {
   console.error("❌ Account ID belum diberikan. Contoh: npm start -- fb01");
@@ -72,6 +76,9 @@ const BROWSER_PROFILE_DIR = path.join(ACCOUNT_DIR, "browser-profile");
 const DEBUG_SCREENSHOT = path.join(ACCOUNT_DIR, "debug-groups-page.png");
 const STOP_FILE = path.join(ACCOUNT_DIR, "stop.request");
 const POSTING_STATS_FILE = path.join(ACCOUNT_DIR, "posting-stats.json");
+const JOIN_PROGRESS_FILE = path.join(ACCOUNT_DIR, "join-progress.json");
+// Pool grup hasil "collect" dari akun-akun yang sudah join; diedit manual juga boleh.
+const POOL_FILE = path.resolve("groups-pool.txt");
 
 async function stopRequested(): Promise<boolean> {
   try {
@@ -523,9 +530,20 @@ async function exportSessionFiles(page: Page): Promise<void> {
       await log("⚠️ Tidak ada cookie untuk di-export — cookie.txt dibiarkan.");
     }
 
-    const items = await page.evaluate(() =>
-      Object.entries(localStorage).map(([key, value]) => ({ key, value: String(value) }))
-    );
+    // FB kadang masih navigasi tepat setelah login → execution context hancur.
+    // Retry singkat supaya localstorage.txt tetap ikut ter-refresh.
+    let items: { key: string; value: string }[] = [];
+    for (let attempt = 1; ; attempt++) {
+      try {
+        items = await page.evaluate(() =>
+          Object.entries(localStorage).map(([key, value]) => ({ key, value: String(value) }))
+        );
+        break;
+      } catch (err) {
+        if (attempt >= 3) throw err;
+        await randomDelay(2000, 3000);
+      }
+    }
     let lsSkip = 0;
     const lsLines: string[] = [];
     for (const { key, value } of items) {
@@ -675,9 +693,23 @@ async function tryAutoLogin(
         url.includes("two_step_verification") ||
         url.includes("login/approval")
       ) {
+        // JANGAN navigasi/return: halaman verifikasi harus tetap terbuka supaya
+        // user bisa menyelesaikan 2FA. Tunggu c_user sampai 10 menit.
         await log(
-          "⚠️ Facebook minta checkpoint/2FA setelah auto-login — butuh sentuhan manusia."
+          "⚠️ Facebook minta checkpoint/2FA — selesaikan verifikasi di jendela browser (maks 10 menit)."
         );
+        const verifyDeadline = Date.now() + 10 * 60 * 1000;
+        while (Date.now() < verifyDeadline) {
+          if (await waitWithStopCheck(3500)) {
+            await log("⏹ STOP diminta saat menunggu verifikasi 2FA → keluar rapi.");
+            process.exit(0);
+          }
+          if (await waitForCuser(page, 2000)) {
+            await log("✅ Verifikasi 2FA selesai — login berhasil.");
+            return true;
+          }
+        }
+        await log("⚠️ Verifikasi 2FA tidak selesai dalam 10 menit.");
         return false;
       }
       const cookies = await page.cookies(
@@ -840,6 +872,11 @@ function setupPageListeners(page: Page): void {
       /* abaikan jika frame sudah detach */
     }
   });
+
+  // Crash/renderer mati sebelumnya membuat worker keluar tanpa jejak.
+  page.on("error", (err) => {
+    void log(`⚠️ Page error: ${err}`);
+  });
 }
 
 // ─── esbuild/tsx `__name` shim ────────────────────────────────────────────────
@@ -863,6 +900,39 @@ async function ensureNameShim(page: Page): Promise<void> {
   }
 }
 
+// ─── Page Lifecycle ───────────────────────────────────────────────────────────
+function isDetachedError(err: unknown): boolean {
+  const msg = String((err as any)?.message ?? err);
+  return /detached|target closed|session closed|protocol error/i.test(msg);
+}
+
+async function configurePage(browser: Browser, page: Page): Promise<void> {
+  setupPageListeners(page);
+  await ensureNameShim(page);
+  await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
+  const context = browser.defaultBrowserContext();
+  await context.overridePermissions("https://www.facebook.com", [
+    "clipboard-read",
+    "clipboard-write",
+  ]);
+  await context.overridePermissions("https://web.facebook.com", [
+    "clipboard-read",
+    "clipboard-write",
+  ]);
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+  });
+}
+
+async function replacePage(browser: Browser, page: Page): Promise<Page> {
+  try {
+    await page.close();
+  } catch {}
+  const fresh = await browser.newPage();
+  await configurePage(browser, fresh);
+  return fresh;
+}
+
 // ─── Safe Navigation ──────────────────────────────────────────────────────────
 async function safeGoto(
   browser: Browser,
@@ -876,22 +946,7 @@ async function safeGoto(
       await page.evaluate(() => document.title);
     } catch {
       await log(`⚠️  Page detached — membuat page baru (attempt ${attempt})`);
-      try {
-        await page.close();
-      } catch {}
-      page = await browser.newPage();
-      await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
-      setupPageListeners(page);
-      await ensureNameShim(page);
-      const context = browser.defaultBrowserContext();
-      await context.overridePermissions("https://www.facebook.com", [
-        "clipboard-read",
-        "clipboard-write",
-      ]);
-      await context.overridePermissions("https://web.facebook.com", [
-        "clipboard-read",
-        "clipboard-write",
-      ]);
+      page = await replacePage(browser, page);
     }
 
     try {
@@ -1264,35 +1319,58 @@ if (await detectLimitOnly(page, groupLabel)) {
   });
   if (isSellSomething) {
     await log(`⏭️  ${groupLabel} → skip (Sell Something group)`);
-    return { page, success: false };
+    return { page, success: false, status: "UNKNOWN" };
   }
 
   // Cari tombol "Tulis sesuatu..." / "Write something..."
-  const writeButtonXPaths = [
-    '//div[@role="button" and .//span[contains(text(), "Tulis sesuatu...")]]',
-    '//div[@role="button" and .//span[contains(text(), "Write something...")]]',
-    '//div[@role="button" and .//span[contains(text(), "Tulis di grup...")]]',
-    '//div[@role="button" and .//span[contains(text(), "Write something in the group...")]]',
-    '//div[@role="button" and .//span[contains(text(), "Buat postingan")]]',
-    '//div[@role="button" and .//span[contains(text(), "Create a post")]]',
-  ];
+  // Satu XPath gabungan = satu kali wait (10 dtk), bukan 6 × 10 dtk.
+  const writeButtonXPath =
+    '//div[@role="button" and (' +
+    './/span[contains(text(), "Tulis sesuatu...")] or ' +
+    './/span[contains(text(), "Write something...")] or ' +
+    './/span[contains(text(), "Tulis di grup...")] or ' +
+    './/span[contains(text(), "Write something in the group...")] or ' +
+    './/span[contains(text(), "Buat postingan")] or ' +
+    './/span[contains(text(), "Create a post")]' +
+    ')]';
 
   let writeButton = null;
-  for (const xp of writeButtonXPaths) {
-    try {
-      writeButton = await page.waitForSelector(`xpath/${xp}`, {
-        timeout: WAIT_TIMEOUT,
-      });
-      if (writeButton) {
-        await log(`✅ ${groupLabel} → write button ditemukan`);
-        break;
-      }
-    } catch {}
-  }
+  try {
+    writeButton = await page.waitForSelector(`xpath/${writeButtonXPath}`, {
+      timeout: WAIT_TIMEOUT,
+    });
+  } catch {}
 
-  if (!writeButton) {
-    await log(`⏭️  ${groupLabel} → write button tidak ditemukan, skip`);
-    return { page, success: false };
+  if (writeButton) {
+    await log(`✅ ${groupLabel} → write button ditemukan`);
+  } else {
+    const blockedReason = await page
+      .evaluate(() => {
+        const text = (document.body?.innerText || "")
+          .toLowerCase()
+          .replace(/\s+/g, " ")
+          .slice(0, 2000);
+        if (/only members can post|hanya anggota (grup )?yang dapat memposting|join (this )?group to post|bergabunglah dengan grup ini/.test(text)) {
+          return "members-only";
+        }
+        if (/only admins can post|hanya admin yang dapat memposting/.test(text)) {
+          return "admin-only";
+        }
+        if (/you must be a member|anda harus menjadi anggota|not a member of this group|bukan anggota grup ini/.test(text)) {
+          return "not-a-member";
+        }
+        if (/this content isn't available|konten ini tidak tersedia/.test(text)) {
+          return "unavailable";
+        }
+        return "";
+      })
+      .catch(() => "");
+    await log(
+      `⏭️  ${groupLabel} → write button tidak ditemukan` +
+        (blockedReason ? ` (${blockedReason})` : "") +
+        `, skip`
+    );
+    return { page, success: false, status: "UNKNOWN" };
   }
 
   await writeButton.click();
@@ -1318,7 +1396,7 @@ if (await detectLimitOnly(page, groupLabel)) {
 
   if (!editor) {
     await log(`❌ ${groupLabel} → editor tidak ditemukan, skip`);
-    return { page, success: false };
+    return { page, success: false, status: "UNKNOWN" };
   }
 
   await editor.click();
@@ -1448,7 +1526,7 @@ if (await detectLimitOnly(page, groupLabel)) {
 
   if (!postButton) {
     await log(`❌ ${groupLabel} → tombol Post tidak ditemukan`);
-    return { page, success: false };
+    return { page, success: false, status: "UNKNOWN" };
   }
 
   // Tunggu tombol siap. Cek aria-disabled dan property disabled.
@@ -1483,12 +1561,10 @@ if (await detectLimitOnly(page, groupLabel)) {
   // Jika iya, jangan retry grup ini karena retry justru berisiko memperparah limit.
   await randomDelay(1000, 2000);
   if (await detectFacebookPostingRestriction(page, groupLabel)) {
-    await recordPostingResult("LIMITED");
     return { page, success: false, status: "LIMITED" };
   }
 
   const postStatus = await detectPostingResult(page, groupLabel, postContent);
-  await recordPostingResult(postStatus);
 
   if (postStatus === "LIMITED") {
     await log(`🛑 ${groupLabel} → proses dihentikan karena LIMIT.`);
@@ -1545,88 +1621,9 @@ async function detectTotalBatches(config: AccountConfig): Promise<number> {
   }
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
-async function main(): Promise<void> {
-  await fs.mkdir(ACCOUNT_DIR, { recursive: true });
-  await fs.rm(STOP_FILE, { force: true }).catch(() => {});
-  const accountConfig = await loadAccountConfig();
-  const totalBatches = await detectTotalBatches(accountConfig);
-
-  if (totalBatches === 0) {
-    await log(`❌ Tidak ada batch di ${CONTENT_DIR}`);
-    await log(`   Buat folder seperti accounts/${ACCOUNT_ID}/content/1/`);
-    return;
-  }
-
-  await log("═══════════════════════════════════════════");
-  await log(`🚀 Facebook Group Auto-Poster — ${accountConfig.name || ACCOUNT_ID}`);
-  await log(`👤 Account ID: ${ACCOUNT_ID}`);
-  await log(`📦 Total batch: ${totalBatches}`);
-  await log("═══════════════════════════════════════════");
-
-  // ── Auto-resume ─────────────────────────────────────────────────────────────
-  // Tidak ada lagi menu mode 1/2/3.
-  // Setiap start selalu membaca progress terakhir.
-  let startBatch = 1;
-  let startGroupIdx = 0;
-
-  const savedProgress = await loadProgress();
-
-  if (savedProgress) {
-    startBatch = Math.max(1, savedProgress.batch);
-    startGroupIdx = Math.max(0, savedProgress.groupIdx);
-
-    await log(
-      `▶️  Auto-resume: batch ${startBatch}, group berikutnya ke-${startGroupIdx + 1}`
-    );
-  } else {
-    await resetPostingStats();
-    await log("▶️  Belum ada progress → mulai dari batch 1, group 1");
-  }
-
-  // ── Launch browser ─────────────────────────────────────────────────────────
-  // userDataDir membuat browser profile PERSISTENT khusus untuk akun ini.
-  // Jangan gunakan profile yang sama untuk dua account secara bersamaan.
-  const browser = await puppeteer.launch({
-    headless: false,
-    userDataDir: BROWSER_PROFILE_DIR,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--start-maximized",
-      // Anti-automation: hilangkan sinyal "bot" supaya FB lebih jarang
-      // checkpoint/logout yang mematikan sesi.
-      "--disable-blink-features=AutomationControlled",
-      "--enable-features=AsyncClipboardAPI",
-    ],
-    ignoreDefaultArgs: ["--enable-automation"],
-    defaultViewport: null,
-  });
-
-  let page = await browser.newPage();
-
-  // Grant clipboard permission
-  const context = browser.defaultBrowserContext();
-  await context.overridePermissions("https://web.facebook.com", [
-    "clipboard-read",
-    "clipboard-write",
-  ]);
-  await context.overridePermissions("https://www.facebook.com", [
-    "clipboard-read",
-    "clipboard-write",
-  ]);
-
-  setupPageListeners(page);
-  await ensureNameShim(page);
-  await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
-  await page.evaluateOnNewDocument(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-  });
-
-  // Sesi: profil dulu, file hanya bootstrap — sekali login tahan lama.
-  await ensureSessionReady(page);
-
-  // ── Kumpulkan semua group links sekali di awal ─────────────────────────────
+// ─── Group Pool (collect / join) ─────────────────────────────────────────────
+// Ambil link grup yang SUDAH di-join akun ini (halaman /groups/joins/).
+async function collectGroupLinks(page: Page): Promise<string[]> {
   await log("📋 Mengumpulkan group links...");
 
   try {
@@ -1707,6 +1704,272 @@ async function main(): Promise<void> {
   ];
 
   await log(`📊 Ditemukan ${groupLinks.length} grup`);
+  return groupLinks;
+}
+
+async function readPool(): Promise<string[]> {
+  const raw = await fs.readFile(POOL_FILE, "utf-8").catch(() => "");
+  return [
+    ...new Set(
+      raw
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+    ),
+  ];
+}
+
+async function collectGroupsToPool(page: Page): Promise<void> {
+  const links = await collectGroupLinks(page);
+  if (!links.length) {
+    await log("❌ Tidak ada grup ditemukan di akun ini — groups-pool.txt tidak diubah.");
+    return;
+  }
+  const pool = await readPool();
+  const set = new Set(pool);
+  let added = 0;
+  for (const link of links) {
+    if (!set.has(link)) {
+      set.add(link);
+      added++;
+    }
+  }
+  await fs.writeFile(POOL_FILE, [...set].join("\n") + "\n", "utf-8");
+  await log(
+    `🧲 ${links.length} grup dari akun ini, ${added} baru → total ${set.size} di groups-pool.txt`
+  );
+}
+
+interface JoinProgress {
+  accountId: string;
+  index: number;
+  joined: string[];
+  failed: string[];
+  timestamp: string;
+}
+
+async function loadJoinProgress(): Promise<JoinProgress> {
+  const raw = await fs.readFile(JOIN_PROGRESS_FILE, "utf-8").catch(() => "");
+  const parsed = raw ? parseJsonSafe<JoinProgress>(raw) : null;
+  if (!parsed || parsed.accountId !== ACCOUNT_ID) {
+    return { accountId: ACCOUNT_ID, index: 0, joined: [], failed: [], timestamp: "" };
+  }
+  return parsed;
+}
+
+async function saveJoinProgress(p: JoinProgress): Promise<void> {
+  p.timestamp = new Date().toISOString();
+  await fs.writeFile(JOIN_PROGRESS_FILE, JSON.stringify(p, null, 2));
+}
+
+// Join satu grup. Aman-gagal: tombol tidak ketemu / pertanyaan membership
+// tidak diisi otomatis (butuh manusia) → dicatat, lanjut grup berikutnya.
+async function joinGroup(
+  page: Page,
+  link: string
+): Promise<"joined" | "pending" | "already" | "manual" | "not-found" | "error"> {
+  try {
+    await page.goto(link, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
+    await randomDelay(3000, 5000);
+
+    const clicked = await page.evaluate(() => {
+      const els = Array.from(
+        document.querySelectorAll('div[role="button"], button, a[role="button"]')
+      );
+      const join = els.find((el) =>
+        /^(join group|join|gabung|gabung grup|minta bergabung)$/i.test(
+          ((el as HTMLElement).innerText || "").trim()
+        )
+      );
+      if (join) {
+        (join as HTMLElement).click();
+        return true;
+      }
+      return false;
+    });
+
+    if (!clicked) {
+      const member = await page
+        .evaluate(() =>
+          /leave group|keluar dari grup|joined|anggota/i.test(document.body.innerText)
+        )
+        .catch(() => false);
+      return member ? "already" : "not-found";
+    }
+
+    await randomDelay(3000, 5000);
+    const state = await page
+      .evaluate(() => {
+        const text = document.body.innerText;
+        if (
+          /membership questions|answer questions|pertanyaan keanggotaan|jawab pertanyaan/i.test(
+            text
+          )
+        )
+          return "manual";
+        if (/cancel request|request sent|permintaan dikirim/i.test(text))
+          return "pending";
+        if (/leave group|keluar dari grup/i.test(text)) return "joined";
+        return "unknown";
+      })
+      .catch(() => "unknown");
+
+    return state === "manual" || state === "pending" ? state : "joined";
+  } catch (err) {
+    await log(`⚠️ Join error ${link}: ${err}`);
+    return "error";
+  }
+}
+
+async function joinGroupsFromPool(page: Page): Promise<void> {
+  const pool = await readPool();
+  if (!pool.length) {
+    await log("❌ groups-pool.txt kosong — jalankan mode collect dulu.");
+    return;
+  }
+
+  const progress = await loadJoinProgress();
+  if (progress.index > 0) {
+    await log(`▶️ Lanjut join dari grup ke-${progress.index + 1}/${pool.length}`);
+  }
+  await log(`➕ Join ${pool.length - progress.index} grup dari groups-pool.txt`);
+
+  for (let i = progress.index; i < pool.length; i++) {
+    if (await stopRequested()) {
+      await saveJoinProgress(progress);
+      await log(`⏹ STOP diminta → join berhenti di grup ke-${i + 1}/${pool.length}`);
+      return;
+    }
+
+    const link = pool[i];
+    const label = `[${i + 1}/${pool.length}]`;
+    await log(`\n${label} → ${link}`);
+    const result = await joinGroup(page, link);
+
+    if (result === "joined" || result === "pending" || result === "already") {
+      progress.joined = [...new Set([...progress.joined, link])];
+      await log(
+        result === "already"
+          ? `${label} sudah member — dilewati.`
+          : result === "pending"
+            ? `${label} permintaan join terkirim (menunggu approval).`
+            : `${label} JOIN OK.`
+      );
+    } else {
+      progress.failed = [...new Set([...progress.failed, link])];
+      await log(`${label} GAGAL (${result}).`);
+    }
+
+    progress.index = i + 1;
+    await saveJoinProgress(progress);
+    if (i < pool.length - 1) await randomDelay(15000, 30000);
+  }
+
+  await log(
+    `✅ Selesai: ${progress.joined.length} berhasil, ${progress.failed.length} gagal, ${progress.index}/${pool.length} diproses.`
+  );
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+async function main(): Promise<void> {
+  await fs.mkdir(ACCOUNT_DIR, { recursive: true });
+  await fs.rm(STOP_FILE, { force: true }).catch(() => {});
+  const accountConfig = await loadAccountConfig();
+  const totalBatches = await detectTotalBatches(accountConfig);
+
+  if (totalBatches === 0 && !COLLECT_MODE && !JOIN_MODE) {
+    await log(`❌ Tidak ada batch di ${CONTENT_DIR}`);
+    await log(`   Buat folder seperti accounts/${ACCOUNT_ID}/content/1/`);
+    return;
+  }
+
+  await log("═══════════════════════════════════════════");
+  await log(`🚀 Facebook Group Auto-Poster — ${accountConfig.name || ACCOUNT_ID}`);
+  await log(`👤 Account ID: ${ACCOUNT_ID}`);
+  await log(`📦 Total batch: ${totalBatches}`);
+  await log("═══════════════════════════════════════════");
+
+  // ── Auto-resume ─────────────────────────────────────────────────────────────
+  // Tidak ada lagi menu mode 1/2/3.
+  // Setiap start selalu membaca progress terakhir.
+  let startBatch = 1;
+  let startGroupIdx = 0;
+
+  const savedProgress = COLLECT_MODE || JOIN_MODE ? null : await loadProgress();
+
+  if (savedProgress) {
+    startBatch = Math.max(1, savedProgress.batch);
+    startGroupIdx = Math.max(0, savedProgress.groupIdx);
+
+    await log(
+      `▶️  Auto-resume: batch ${startBatch}, group berikutnya ke-${startGroupIdx + 1}`
+    );
+  } else if (!COLLECT_MODE && !JOIN_MODE) {
+    await resetPostingStats();
+    await log("▶️  Belum ada progress → mulai dari batch 1, group 1");
+  }
+
+  // ── Launch browser ─────────────────────────────────────────────────────────
+  // userDataDir membuat browser profile PERSISTENT khusus untuk akun ini.
+  // Jangan gunakan profile yang sama untuk dua account secara bersamaan.
+  const browser = await puppeteer.launch({
+    headless: false,
+    userDataDir: BROWSER_PROFILE_DIR,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--start-maximized",
+      // Anti-automation: hilangkan sinyal "bot" supaya FB lebih jarang
+      // checkpoint/logout yang mematikan sesi.
+      "--disable-blink-features=AutomationControlled",
+      "--enable-features=AsyncClipboardAPI",
+    ],
+    ignoreDefaultArgs: ["--enable-automation"],
+    defaultViewport: null,
+  });
+
+  // Pakai tab awal Chrome (jangan buka tab kedua): newPage() tepat setelah
+  // launch kadang menghasilkan frame detached yang mematikan session init.
+  const initialPages = await browser.pages();
+  let page = initialPages[0] ?? (await browser.newPage());
+  for (const extra of initialPages.slice(1)) {
+    await extra.close().catch(() => {});
+  }
+  await configurePage(browser, page);
+
+  browser.on("disconnected", () => {
+    void log("🔌 Browser disconnected (normal saat selesai/stop; abnormal jika tiba-tiba saat posting).");
+  });
+
+  // Sesi: profil dulu, file hanya bootstrap — sekali login tahan lama.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await ensureSessionReady(page);
+      break;
+    } catch (err) {
+      if (attempt >= 2 || !isDetachedError(err)) throw err;
+      await log(
+        `⚠️ Session init gagal karena page detached — buat page baru lalu retry: ` +
+          String((err as any)?.message ?? err).split("\n")[0]
+      );
+      page = await replacePage(browser, page);
+    }
+  }
+
+  // ── Mode khusus: kumpulkan grup / join grup ────────────────────────────────
+  if (COLLECT_MODE) {
+    await collectGroupsToPool(page);
+    await browser.close();
+    return;
+  }
+  if (JOIN_MODE) {
+    await joinGroupsFromPool(page);
+    await browser.close();
+    return;
+  }
+
+  // ── Kumpulkan semua group links sekali di awal ─────────────────────────────
+  const groupLinks = await collectGroupLinks(page);
 
   if (groupLinks.length === 0) {
     await log(
@@ -1767,6 +2030,7 @@ async function main(): Promise<void> {
 
       try {
         let completed = false;
+        let lastStatus: PostingStatus | undefined;
 
         // Jangan langsung skip jika selector/UI gagal.
         // Progress hanya maju jika posting mendapat hasil yang terverifikasi.
@@ -1785,6 +2049,7 @@ async function main(): Promise<void> {
             await log(
               `🛑 ${groupLabel} → proses dihentikan sebelum retry karena Facebook membatasi aktivitas posting.`
             );
+            await recordPostingResult("LIMITED");
             await saveProgress(batch, i);
             await browser.close();
             return;
@@ -1800,8 +2065,10 @@ async function main(): Promise<void> {
               groupLabel
             );
             page = result.page;
+            lastStatus = result.status;
 
             if (result.status === "LIMITED") {
+              await recordPostingResult("LIMITED");
               await log(`\n🛑 STOP: Facebook mendeteksi pembatasan posting.`);
               await log(`   Batch terakhir: ${batch}`);
               await log(`   Group terakhir: ${i + 1}`);
@@ -1816,6 +2083,7 @@ async function main(): Promise<void> {
               result.status === "PENDING_APPROVAL"
             ) {
               completed = true;
+              await recordPostingResult(result.status);
               consecutiveSkips = 0; // grup berhasil → reset penghitung skip berturut-turut
               await saveProgress(batch, i + 1);
               await log(`💾 Progress: batch=${batch}, nextGroup=${i + 2}`);
@@ -1870,6 +2138,7 @@ async function main(): Promise<void> {
           // sebagai i+1 (grup ini dilewati), dan for-loop di bawah secara alami tetap
           // berada di batch yang sama sampai semua grup di batch ini diproses.
           consecutiveSkips++;
+          await recordPostingResult(lastStatus ?? "UNKNOWN");
           await saveProgress(batch, i + 1);
           await log(
             `⏭️ ${groupLabel} → GAGAL setelah ${MAX_POST_ATTEMPTS} percobaan (bukan limit). ` +
