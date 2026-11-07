@@ -4,3 +4,6 @@ dist/
 accounts/
 akunbot
 akunril
+dashboard-*.txt
+run-*-out.txt
+groups-pool.txt

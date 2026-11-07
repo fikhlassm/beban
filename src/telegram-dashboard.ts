@@ -1,7 +1,9 @@
 import "dotenv/config";
 import { Telegraf, Markup, Context } from "telegraf";
+import { message } from "telegraf/filters";
 import { spawn, ChildProcess } from "child_process";
 import fs from "fs/promises";
+import os from "os";
 import path from "path";
 
 const ROOT_DIR = path.resolve(process.cwd());
@@ -43,6 +45,17 @@ const hangAlerted = new Set<string>();
 // Guard race: START yang ditekan cepat berulang tidak boleh spawn dua child.
 const starting = new Set<string>();
 const PAGE_SIZE = 10;
+const BATCH_PAGE_SIZE = 10;
+const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
+const BATCH_STAGING_DIR = path.join(os.tmpdir(), "telegram-batch-staging");
+// Draft tambah batch per chat admin.
+type BatchDraft =
+  | { step: "photo"; at: number }
+  | { step: "caption"; file: string; ext: string; at: number };
+const batchDrafts = new Map<number, BatchDraft>();
+const BATCH_DRAFT_TTL_MS = 10 * 60 * 1000;
+// Mutex sederhana: satu operasi tambah/hapus batch dalam satu waktu.
+let batchMutation = false;
 const periodicPageByChat = new Map<number, number>();
 let shutdownStarted = false;
 let periodicMessage: { chatId: number; messageId: number } | null = null;
@@ -155,18 +168,42 @@ function pruneDaily(map: Record<string, number>, keep: number): void {
   while (keys.length > keep) delete map[keys.shift() as string];
 }
 
-async function markWorkerStarted(id: string): Promise<void> {
+// Dashboard bisa mati mendadak sehingga sesi lama tidak sempat di-flush. Tutup
+// sesi itu memakai waktu tulis log terakhir sebagai perkiraan akhir sesi —
+// jangan pakai "sekarang", karena downtime bisa berhari-hari dan durasi
+// "hari ini" akan membengkak. Aman dipanggil saat tidak ada sisa sesi.
+async function closeStaleSession(id: string): Promise<RuntimeState> {
   const rt = await readRuntime(id);
-  // Ada sisa sesi sebelumnya yang belum di-flush (dashboard pernah mati paksa)
-  // → kreditkan dulu ke bucket hari ini supaya durasi tidak hilang.
-  if (rt.lastStartedAt !== null) {
-    const leftover = Math.max(0, Date.now() - rt.lastStartedAt);
-    rt.daily[todayKey()] = (rt.daily[todayKey()] ?? 0) + leftover;
-  }
+  if (rt.lastStartedAt === null) return rt;
+
+  let end = rt.lastStartedAt;
+  try {
+    const stat = await fs.stat(path.join(ACCOUNTS_DIR, id, "log.txt"));
+    end = Math.max(end, Math.min(Date.now(), stat.mtimeMs));
+  } catch {}
+
+  const day = new Date(end).toLocaleDateString("sv-SE");
+  rt.daily[day] = (rt.daily[day] ?? 0) + Math.max(0, end - rt.lastStartedAt);
+  rt.lastStartedAt = null;
+  pruneDaily(rt.daily, RUNTIME_KEEP_DAYS);
+  await writeRuntime(id, rt);
+  return rt;
+}
+
+async function closeStaleSessions(): Promise<void> {
+  const ids = await accounts();
+  await Promise.all(ids.map((id) => closeStaleSession(id).catch(() => null)));
+}
+
+async function markWorkerStarted(id: string): Promise<void> {
+  const rt = await closeStaleSession(id);
   rt.lastStartedAt = Date.now();
   pruneDaily(rt.daily, RUNTIME_KEEP_DAYS);
   await writeRuntime(id, rt);
 }
+
+// Dijalankan sekali saat dashboard hidup, sebelum worker/status apa pun.
+const staleSessionsReady = closeStaleSessions().catch(() => {});
 
 async function flushRuntime(id: string, nowMs: number): Promise<void> {
   // Kredit durasi sesi berjalan ke bucket hari ini lalu tutup sesi.
@@ -219,6 +256,430 @@ async function accounts(): Promise<string[]> {
   }
 }
 
+async function joinPoolTotal(): Promise<number> {
+  try {
+    const raw = await fs.readFile(path.join(ROOT_DIR, "groups-pool.txt"), "utf8");
+    return raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).length;
+  } catch {
+    return 0;
+  }
+}
+
+// ─── Konten batch (accounts/<id>/content/<n>) ────────────────────────────────
+// Satu batch = satu folder konten. Fitur tambah/hapus menulis atau menghapus
+// folder yang sama di SEMUA akun, jadi satu gambar + caption dipakai bersama.
+async function batchNumbersOf(id: string): Promise<number[]> {
+  try {
+    const entries = await fs.readdir(path.join(ACCOUNTS_DIR, id, "content"), {
+      withFileTypes: true,
+    });
+    return entries
+      .filter((e) => e.isDirectory() && /^\d+$/.test(e.name))
+      .map((e) => Number(e.name))
+      .filter((n) => Number.isInteger(n) && n > 0);
+  } catch {
+    return [];
+  }
+}
+
+async function allBatchNumbers(): Promise<number[]> {
+  const set = new Set<number>();
+  for (const id of await accounts()) {
+    for (const n of await batchNumbersOf(id)) set.add(n);
+  }
+  return [...set].sort((a, b) => a - b);
+}
+
+async function nextBatchNumber(): Promise<number> {
+  // Nomor batch selalu mengikuti isi folder (1..N), bukan progress. Progress
+  // lama tidak boleh membuat batch baru mulai dari nomor tinggi setelah batch
+  // lama dihapus.
+  const nums = await allBatchNumbers();
+  return (nums.length ? nums[nums.length - 1] : 0) + 1;
+}
+
+interface BatchSummary {
+  n: number;
+  accounts: number;
+  images: number;
+  caption: string;
+}
+
+async function batchSummary(n: number): Promise<BatchSummary> {
+  let accountCount = 0;
+  let images = 0;
+  let caption = "";
+  for (const id of await accounts()) {
+    const dir = path.join(ACCOUNTS_DIR, id, "content", String(n));
+    try {
+      await fs.access(dir);
+    } catch {
+      continue;
+    }
+    accountCount++;
+    if (!caption) {
+      caption = await fs.readFile(path.join(dir, "text.txt"), "utf8").catch(() => "");
+    }
+    if (!images) {
+      const files = await fs.readdir(path.join(dir, "images")).catch(() => [] as string[]);
+      images = files.filter((f) =>
+        IMAGE_EXTENSIONS.has(path.extname(f).toLowerCase())
+      ).length;
+    }
+  }
+  return { n, accounts: accountCount, images, caption };
+}
+
+// config.totalBatches = folder tertinggi akun itu, supaya worker tidak
+// mencoba batch yang sudah dihapus. Field lain (id/name) dipertahankan.
+async function syncAccountTotalBatches(id: string): Promise<void> {
+  const nums = await batchNumbersOf(id);
+  const highest = nums.length ? Math.max(...nums) : 0;
+  const file = path.join(ACCOUNTS_DIR, id, "config.json");
+  const config = await readJson<Config & Record<string, unknown>>(file);
+  if (!config || config.totalBatches === highest) return;
+  config.totalBatches = highest;
+  await fs.writeFile(file, JSON.stringify(config)).catch(() => {});
+}
+
+// Akun lama yang sudah menyelesaikan semua batch (progress dihapus versi lama)
+// langsung diarahkan ke batch baru supaya tidak mengulang konten dari batch 1.
+async function seedCompletedProgress(id: string, batch: number): Promise<void> {
+  if (workers.has(id) || starting.has(id)) return;
+  const progress = await readJson<Progress>(path.join(ACCOUNTS_DIR, id, "progress.json"));
+  if (progress?.accountId === id && progress.batch > 0) return;
+  const stats = await readJson<PostingStats>(path.join(ACCOUNTS_DIR, id, "posting-stats.json"));
+  if ((stats?.total ?? 0) <= 0) return;
+  await fs
+    .writeFile(
+      path.join(ACCOUNTS_DIR, id, "progress.json"),
+      JSON.stringify(
+        {
+          accountId: id,
+          batch,
+          groupIdx: 0,
+          timestamp: new Date().toISOString(),
+        },
+        null,
+        2
+      )
+    )
+    .catch(() => {});
+}
+
+// Saat nomor batch dipakai ulang (sentinel / bekas batch yang dihapus), mulai
+// dari grup 1 supaya konten baru tidak mewarisi posisi grup batch lama.
+async function resetProgressGroup(id: string, batch: number): Promise<void> {
+  const file = path.join(ACCOUNTS_DIR, id, "progress.json");
+  const progress = await readJson<Progress>(file);
+  if (!progress || progress.accountId !== id || progress.batch !== batch) return;
+  if (progress.groupIdx === 0) return;
+  progress.groupIdx = 0;
+  progress.timestamp = new Date().toISOString();
+  await fs.writeFile(file, JSON.stringify(progress, null, 2)).catch(() => {});
+}
+
+// Rapikan nomor batch jadi 1..N di semua akun. Dipakai saat start dashboard
+// (memperbaiki data lama) dan setelah hapus batch. Rename dilakukan dari nomor
+// kecil ke besar supaya target selalu kosong.
+async function normalizeBatchNumbers(): Promise<{ changed: boolean; failed: string[] }> {
+  const nums = await allBatchNumbers();
+  const map = new Map<number, number>();
+  nums.forEach((n, i) => map.set(n, i + 1));
+  const maxOld = nums.length ? nums[nums.length - 1] : 0;
+  const newTotal = nums.length;
+  const failed: string[] = [];
+  const failedAccounts = new Set<string>();
+  let changed = false;
+
+  for (const id of await accounts()) {
+    const accountNums = (await batchNumbersOf(id)).sort((a, b) => a - b);
+    for (const old of accountNums) {
+      const next = map.get(old);
+      if (next === undefined || next === old) continue;
+      try {
+        await fs.rename(
+          path.join(ACCOUNTS_DIR, id, "content", String(old)),
+          path.join(ACCOUNTS_DIR, id, "content", String(next))
+        );
+        changed = true;
+      } catch {
+        failed.push(`${id} B${old}→B${next}`);
+        failedAccounts.add(id);
+      }
+    }
+
+    await syncAccountTotalBatches(id);
+    if (failedAccounts.has(id)) continue;
+
+    const file = path.join(ACCOUNTS_DIR, id, "progress.json");
+    const progress = await readJson<Progress>(file);
+    if (!progress) continue;
+    const before = JSON.stringify(progress);
+    const invalid = !!progress.accountId && progress.accountId !== id;
+    progress.accountId = id;
+    if (invalid) {
+      progress.batch = 1;
+      progress.groupIdx = 0;
+    } else if (progress.batch > maxOld) {
+      // Sentinel (total lama + 1) → sentinel baru.
+      progress.batch = newTotal + 1;
+      progress.groupIdx = 0;
+    } else if (map.has(progress.batch)) {
+      // Batch masih ada → ikut nomor baru, posisi grup dipertahankan.
+      progress.batch = map.get(progress.batch)!;
+    } else {
+      // Batch yang ditunjuk sudah dihapus → lanjut ke batch berikutnya.
+      const nextOld = nums.find((n) => n > progress.batch);
+      progress.batch = nextOld !== undefined ? map.get(nextOld)! : newTotal + 1;
+      progress.groupIdx = 0;
+    }
+    if (JSON.stringify(progress) !== before) {
+      progress.timestamp = new Date().toISOString();
+      await fs.writeFile(file, JSON.stringify(progress, null, 2)).catch(() => {});
+    }
+  }
+
+  return { changed, failed };
+}
+
+async function saveBatchToAll(
+  n: number,
+  caption: string,
+  stagedFile: string,
+  ext: string
+): Promise<{ ok: string[]; failed: string[] }> {
+  const ok: string[] = [];
+  const failed: string[] = [];
+  for (const id of await accounts()) {
+    const dir = path.join(ACCOUNTS_DIR, id, "content", String(n));
+    try {
+      const imagesDir = path.join(dir, "images");
+      await fs.mkdir(imagesDir, { recursive: true });
+      // Gambar dulu, text.txt terakhir: text.txt adalah penanda batch siap.
+      await fs.copyFile(stagedFile, path.join(imagesDir, `image${ext}`));
+      await fs.writeFile(path.join(dir, "text.txt"), caption);
+      await syncAccountTotalBatches(id);
+      await resetProgressGroup(id, n);
+      await seedCompletedProgress(id, n);
+      ok.push(id);
+    } catch {
+      // Nomor ini baru, jadi folder sisa (kalau ada) aman dibersihkan.
+      await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+      failed.push(id);
+    }
+  }
+  return { ok, failed };
+}
+
+async function deleteBatchFromAll(
+  n: number
+): Promise<{ ok: string[]; failed: string[] }> {
+  const ok: string[] = [];
+  const failed: string[] = [];
+  for (const id of await accounts()) {
+    const dir = path.join(ACCOUNTS_DIR, id, "content", String(n));
+    let hasBatch = true;
+    try {
+      await fs.access(dir);
+    } catch {
+      hasBatch = false; // akun ini memang tidak punya batch tersebut
+    }
+
+    try {
+      if (hasBatch) {
+        await fs.rm(dir, { recursive: true, force: true });
+        ok.push(id);
+      }
+    } catch {
+      failed.push(id);
+    }
+  }
+
+  // Kalau semua akun berhasil, nomor langsung dirapikan 1..N.
+  // Kalau ada yang gagal, jangan geser nomor: batch n masih ada di akun itu.
+  if (!failed.length) {
+    await normalizeBatchNumbers();
+  } else {
+    for (const id of await accounts()) await syncAccountTotalBatches(id);
+  }
+  return { ok, failed };
+}
+
+function activeWorkerIds(): string[] {
+  return [...new Set([...workers.keys(), ...starting.keys(), ...restartTimers.keys()])];
+}
+
+async function downloadBatchImage(
+  ctx: Context,
+  fileId: string,
+  suggestedExt: string
+): Promise<{ file: string; ext: string }> {
+  const link = await ctx.telegram.getFileLink(fileId);
+  const res = await fetch(link);
+  if (!res.ok) throw new Error(`gagal unduh gambar (HTTP ${res.status})`);
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const ext = IMAGE_EXTENSIONS.has(suggestedExt.toLowerCase())
+    ? suggestedExt.toLowerCase()
+    : ".jpg";
+  await fs.mkdir(BATCH_STAGING_DIR, { recursive: true });
+  const file = path.join(
+    BATCH_STAGING_DIR,
+    `${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`
+  );
+  await fs.writeFile(file, buffer);
+  return { file, ext };
+}
+
+function batchPageCount(total: number): number {
+  return Math.max(1, Math.ceil(total / BATCH_PAGE_SIZE));
+}
+
+function normalizeBatchPage(page: number, total: number): number {
+  return Math.min(Math.max(0, page), batchPageCount(total) - 1);
+}
+
+async function batchManagerText(page: number): Promise<string> {
+  const nums = await allBatchNumbers();
+  if (!nums.length) {
+    return "📦 <b>BATCH KONTEN</b>\n\nBelum ada batch. Tekan ➕ Tambah Batch untuk mengisi konten pertama.";
+  }
+
+  const safe = normalizeBatchPage(page, nums.length);
+  const visible = nums.slice(safe * BATCH_PAGE_SIZE, safe * BATCH_PAGE_SIZE + BATCH_PAGE_SIZE);
+  const summaries = await Promise.all(visible.map(batchSummary));
+
+  const lines = [
+    "📦 <b>BATCH KONTEN</b>",
+    `📄 Halaman <b>${safe + 1}/${batchPageCount(nums.length)}</b> • ${nums.length} batch`,
+    "━━━━━━━━━━━━━━━━━━━━",
+  ];
+  for (const b of summaries) {
+    const flat = b.caption.replace(/\s+/g, " ").trim();
+    const preview = flat ? `${flat.slice(0, 70)}${flat.length > 70 ? "…" : ""}` : "(caption kosong)";
+    lines.push(
+      `<b>B${b.n}</b> • ${b.accounts} akun • ${b.images} gambar`,
+      `   ${esc(preview)}`
+    );
+  }
+  lines.push("", "Batch baru otomatis diterapkan ke semua akun.");
+  return lines.join("\n");
+}
+
+async function batchManagerKeyboard(page: number) {
+  const nums = await allBatchNumbers();
+  const safe = normalizeBatchPage(page, nums.length);
+  const visible = nums.slice(safe * BATCH_PAGE_SIZE, safe * BATCH_PAGE_SIZE + BATCH_PAGE_SIZE);
+
+  const rows: ReturnType<typeof Markup.button.callback>[][] = [];
+  for (let i = 0; i < visible.length; i += 5) {
+    rows.push(
+      visible
+        .slice(i, i + 5)
+        .map((n) => Markup.button.callback(`🗑 B${n}`, `batchdel:${n}`))
+    );
+  }
+
+  const nav = [];
+  if (safe > 0) nav.push(Markup.button.callback("⬅ Prev", `batchpage:${safe - 1}`));
+  if (nums.length) nav.push(Markup.button.callback(`${safe + 1}/${batchPageCount(nums.length)}`, "noop"));
+  if (safe < batchPageCount(nums.length) - 1) {
+    nav.push(Markup.button.callback("Next ➡", `batchpage:${safe + 1}`));
+  }
+  if (nav.length) rows.push(nav);
+
+  rows.push([Markup.button.callback("➕ Tambah Batch", "batchadd")]);
+  rows.push([Markup.button.callback("⬅ Dashboard", "dashboard")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function replyBatchManager(ctx: Context, page = 0): Promise<void> {
+  const nums = await allBatchNumbers();
+  const safe = normalizeBatchPage(page, nums.length);
+  await ctx.replyWithHTML(
+    await batchManagerText(safe),
+    await batchManagerKeyboard(safe)
+  );
+}
+
+function batchAddPrompt(): string {
+  return [
+    "➕ <b>TAMBAH BATCH KONTEN</b>",
+    "",
+    "Kirim 1 foto atau file gambar + caption dalam satu pesan.",
+    "Gambar dan caption akan dipakai semua akun.",
+    "",
+    "Ketik /batal untuk membatalkan.",
+  ].join("\n");
+}
+
+async function finalizeBatchDraft(
+  ctx: Context,
+  chatId: number,
+  draft: { file: string; ext: string },
+  caption: string
+): Promise<void> {
+  if (batchMutation) {
+    batchDrafts.delete(chatId);
+    await fs.rm(draft.file, { force: true }).catch(() => {});
+    await ctx.reply("⏳ Operasi batch lain sedang berjalan. Coba kirim lagi sebentar.");
+    return;
+  }
+
+  batchMutation = true;
+  batchDrafts.delete(chatId);
+  try {
+    const n = await nextBatchNumber();
+    const result = await saveBatchToAll(n, caption, draft.file, draft.ext);
+    if (!result.ok.length) {
+      throw new Error("tidak ada akun yang berhasil ditulis");
+    }
+    const lines = [
+      `✅ <b>Batch ${n}</b> ditambahkan ke ${result.ok.length}/${result.ok.length + result.failed.length} akun.`,
+      `🖼 1 gambar • caption ${caption.trim().split(/\r?\n/).length} baris`,
+    ];
+    if (result.failed.length) {
+      lines.push(`⚠️ Gagal: ${esc(result.failed.join(", "))}`);
+    }
+    if (workers.size) {
+      lines.push(
+        "",
+        "ℹ️ Worker yang sedang berjalan perlu di-restart agar batch ini ikut diproses sesi ini."
+      );
+    }
+    await ctx.replyWithHTML(
+      lines.join("\n"),
+      Markup.inlineKeyboard([[Markup.button.callback("📦 Lihat Batch", "batch")]])
+    );
+  } catch (err) {
+    await ctx.reply(
+      `❌ Gagal menambah batch: ${String((err as Error)?.message ?? err).slice(0, 200)}`
+    );
+  } finally {
+    batchMutation = false;
+    await fs.rm(draft.file, { force: true }).catch(() => {});
+  }
+}
+
+async function handleBatchImage(
+  ctx: Context,
+  fileId: string,
+  ext: string,
+  caption: string
+): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+  const staged = await downloadBatchImage(ctx, fileId, ext);
+  if (caption.trim()) {
+    await finalizeBatchDraft(ctx, chatId, staged, caption);
+    return;
+  }
+  batchDrafts.set(chatId, { step: "caption", file: staged.file, ext: staged.ext, at: Date.now() });
+  await ctx.reply(
+    "🖼 Gambar diterima. Sekarang kirim teks caption (boleh multi-baris).\nKetik /batal untuk membatalkan."
+  );
+}
+
 const LIMIT_RE =
   /LIMIT terdeteksi:\s*"([^"]+)"|STOP: Facebook mendeteksi pembatasan posting|akun terdeteksi LIMIT|proses dihentikan karena LIMIT/i;
 
@@ -228,7 +689,13 @@ async function readLogInfo(id: string): Promise<{ last: string; sessionText: str
     const lines = text.trim().split(/\r?\n/);
     let start = 0;
     for (let i = lines.length - 1; i >= 0; i--) {
-      if (/Mulai dalam 3 detik/.test(lines[i])) {
+      // Awal sesi baru: "Mulai ... dalam 3 detik" (run normal), "Auto-resume",
+      // atau "Belum ada progress". Mencegah LIMIT dari sesi lama terbaca ulang
+      // saat sesi baru exit cepat (mis. semua batch sudah selesai).
+      if (
+        /Mulai\b.*dalam 3 detik/.test(lines[i]) ||
+        /Auto-resume:|Belum ada progress/.test(lines[i])
+      ) {
         start = i + 1;
         break;
       }
@@ -248,17 +715,28 @@ function detectLimit(sessionText: string): string | null {
   return match[1] ?? "pembatasan posting dari Facebook";
 }
 
+interface JoinProgress {
+  accountId: string;
+  index: number;
+  joined: string[];
+  failed: string[];
+  timestamp: string;
+}
+
 async function statusOf(id: string) {
   const running = workers.has(id);
-  const [progress, config, logInfo, stats, runtime] = await Promise.all([
+  const [progress, config, logInfo, stats, runtime, joinProgress] = await Promise.all([
     readJson<Progress>(path.join(ACCOUNTS_DIR, id, "progress.json")),
     readJson<Config>(path.join(ACCOUNTS_DIR, id, "config.json")),
     readLogInfo(id),
     readJson<PostingStats>(path.join(ACCOUNTS_DIR, id, "posting-stats.json")),
     readRuntime(id),
+    readJson<JoinProgress>(path.join(ACCOUNTS_DIR, id, "join-progress.json")),
   ]);
   const log = logInfo.last;
   const limitReason = detectLimit(logInfo.sessionText);
+  const mode = workerModes.get(id) ?? "";
+  const poolTotal = joinProgress ? await joinPoolTotal() : 0;
 
   let icon = running ? "🟢" : "🔴";
   let state = running ? "RUNNING" : "STOPPED";
@@ -266,18 +744,33 @@ async function statusOf(id: string) {
   if (limitReason) {
     icon = "🚫";
     state = "LIMIT / BLOCKED";
+  } else if (running && mode === "join") {
+    icon = "➕";
+    state = "JOIN GRUP";
+  } else if (running && mode === "collect") {
+    icon = "🧲";
+    state = "COLLECT GRUP";
   } else if (!running && /semua batch selesai/i.test(log)) {
     icon = "🔵";
     state = "COMPLETED";
-  } else if (!running && /tidak ada grup|tidak ada batch/i.test(log)) {
+  } else if (!running && /tidak ada grup|tidak ada batch/i.test(logInfo.sessionText)) {
     // Keluar sebab setup (grup/konten kosong) — bukan crash, tidak layak auto-restart.
     icon = "⚙️";
     state = "SETUP ERROR";
   }
 
-  const position = progress
-    ? `B${progress.batch} • G${progress.groupIdx + 1}`
-    : "B1 • G1";
+  const completed =
+    !!progress &&
+    (config?.totalBatches ?? 0) > 0 &&
+    progress.batch > (config?.totalBatches ?? 0);
+  const position =
+    mode === "join" && joinProgress
+      ? `Join ${joinProgress.index}/${poolTotal}`
+      : completed
+        ? "✅ Selesai"
+        : progress
+          ? `B${progress.batch} • G${progress.groupIdx + 1}`
+          : "B1 • G1";
 
   // Durasi sesi berjalan (hanya bila worker hidup).
   let sessionMs = 0;
@@ -303,6 +796,15 @@ async function statusOf(id: string) {
     sessionMs,
     postsTotal: stats?.total ?? 0,
     postsToday: stats?.daily?.[todayKey()] ?? null,
+    joinProgress: joinProgress
+      ? {
+          index: joinProgress.index,
+          total: poolTotal,
+          joined: joinProgress.joined?.length ?? 0,
+          failed: joinProgress.failed?.length ?? 0,
+        }
+      : null,
+    mode,
     runtime,
   };
 }
@@ -345,6 +847,7 @@ function dashboardKeyboard(ids: string[], page: number) {
     Markup.button.callback("🔄 Refresh", `page:${safePage}`),
     Markup.button.callback("📊 Ringkasan", "summary"),
   ]);
+  rows.push([Markup.button.callback("📦 Batch Konten", "batch")]);
 
   return Markup.inlineKeyboard(rows);
 }
@@ -352,6 +855,7 @@ function dashboardKeyboard(ids: string[], page: number) {
 function accountKeyboard(id: string) {
   return Markup.inlineKeyboard([
     [Markup.button.callback("▶ START / RESUME", `start:${id}`), Markup.button.callback("⏹ STOP", `stop:${id}`)],
+    [Markup.button.callback("➕ Join Grup", `join:${id}`), Markup.button.callback("♻️ Reset Join", `resetjoin:${id}`)],
     [Markup.button.callback("🔄 STATUS", `view:${id}`)],
     [Markup.button.callback("⬅ Dashboard", "dashboard")],
   ]);
@@ -551,6 +1055,9 @@ async function handleWorkerExit(id: string, exitInfo: string): Promise<void> {
       void startWorker(id, false);
     }, delay)
   );
+
+  // Worker keluar → buka slot antrean Start All.
+  pumpStartAllQueue();
 }
 
 async function startWorker(id: string, resetFailures = true, mode = ""): Promise<string> {
@@ -569,6 +1076,7 @@ async function startWorkerInner(
   resetFailures: boolean,
   mode = ""
 ): Promise<string> {
+  await staleSessionsReady; // jangan spawn sebelum sesi lama ditutup
   cancelScheduledRestart(id, false); // restart terjadwal: hitungan kegagalan tetap
   if (resetFailures) failCount.delete(id); // start manual = siklus baru
   hangAlerted.delete(id);
@@ -586,7 +1094,11 @@ async function startWorkerInner(
     [TSX_CLI, WORKER_SCRIPT, id, ...(mode ? [mode] : [])],
     {
       cwd: ROOT_DIR,
-      env: { ...process.env, DASHBOARD_MODE: "1" },
+      env: {
+        ...process.env,
+        DASHBOARD_MODE: "1",
+        WORKER_LAUNCH_AT: String(Date.now()),
+      },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     }
@@ -798,6 +1310,12 @@ bot.action(/^view:(.+)$/, async (ctx) => {
     } • ⏱ ${fmtDuration(runtimeTodayMs(data.runtime))}`,
     `Total post: 📤 ${data.postsTotal}`,
   ];
+  if (data.joinProgress) {
+    const jp = data.joinProgress;
+    lines.push(`Join grup: ${jp.index}/${jp.total} • ✅ ${jp.joined} • ❌ ${jp.failed}`);
+  }
+  if (data.mode === "join") lines.push("Mode: ➕ JOIN GRUP");
+  if (data.mode === "collect") lines.push("Mode: 🧲 COLLECT GRUP");
   if (data.log) {
     lines.push(`Log terakhir: <code>${esc(data.log.slice(-700))}</code>`);
   }
@@ -818,36 +1336,122 @@ bot.action(/^stop:(.+)$/, async (ctx) => {
   await ctx.reply(await stopWorker(id));
 });
 
+bot.action(/^join:(.+)$/, async (ctx) => {
+  if (!auth(ctx)) return void ctx.answerCbQuery("Akses ditolak", { show_alert: true });
+  const id = String(ctx.match[1]);
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) return void ctx.answerCbQuery("ID tidak valid", { show_alert: true });
+  await ctx.answerCbQuery("Join grup...");
+  await ctx.reply(await startWorker(id, true, "join"));
+});
+
+bot.action(/^resetjoin:(.+)$/, async (ctx) => {
+  if (!auth(ctx)) return void ctx.answerCbQuery("Akses ditolak", { show_alert: true });
+  const id = String(ctx.match[1]);
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) return void ctx.answerCbQuery("ID tidak valid", { show_alert: true });
+  await ctx.answerCbQuery();
+  if (workers.has(id) || starting.has(id)) {
+    return void ctx.reply(`⏹ ${id} masih berjalan — stop dulu sebelum reset join.`);
+  }
+  await fs.rm(path.join(ACCOUNTS_DIR, id, "join-progress.json"), { force: true });
+  await ctx.reply(`♻️ Join progress ${id} direset. Run join berikutnya mulai dari grup 1.`);
+});
+
+// ─── Start All queue (human-like scheduling) ─────────────────────────────────
+// Akun dimulai dalam urutan acak dengan jeda 2-10 menit, maksimal
+// POST_CONCURRENCY akun posting bersamaan. Slot berikutnya dibuka saat
+// worker selesai/berhenti. Stop All menghapus antrean.
+const POST_CONCURRENCY = Number(process.env.POST_CONCURRENCY || "2");
+const START_ALL_STAGGER_MIN_MS = 2 * 60 * 1000;
+const START_ALL_STAGGER_MAX_MS = 10 * 60 * 1000;
+let startAllQueue: string[] = [];
+let startAllGeneration = 0;
+
+function activePostingCount(): number {
+  let count = 0;
+  for (const [id, mode] of workerModes) {
+    if (mode === "" && workers.has(id)) count++;
+  }
+  return count;
+}
+
+function pumpStartAllQueue(): void {
+  void (async () => {
+    const generation = startAllGeneration;
+    while (
+      generation === startAllGeneration &&
+      startAllQueue.length > 0 &&
+      !shutdownStarted
+    ) {
+      if (activePostingCount() >= POST_CONCURRENCY) {
+        await sleep(30_000);
+        continue;
+      }
+      const id = startAllQueue.shift()!;
+      const stagger =
+        START_ALL_STAGGER_MIN_MS +
+        Math.floor(Math.random() * (START_ALL_STAGGER_MAX_MS - START_ALL_STAGGER_MIN_MS));
+      await sleep(stagger);
+      if (generation !== startAllGeneration || shutdownStarted) break;
+      if (workers.has(id)) continue; // sudah jalan (auto-restart/manual)
+      try {
+        console.log(await startWorker(id));
+      } catch (err) {
+        console.error(`Gagal start ${id} dari antrean:`, err);
+      }
+    }
+  })();
+}
+
 bot.action("startall", async (ctx) => {
   if (!auth(ctx)) return void ctx.answerCbQuery("Akses ditolak", { show_alert: true });
   await ctx.answerCbQuery("Starting all...");
   const ids = await accounts();
-  const pending = ids.filter((id) => !workers.has(id));
+  const pending = ids.filter((id) => !workers.has(id) && !startAllQueue.includes(id));
   const chatId = ctx.chat?.id;
 
   if (!pending.length) {
-    await ctx.reply("⚠️ Semua akun sudah berjalan.");
+    await ctx.reply("?? Semua akun sudah berjalan / dalam antrean.");
     return;
   }
 
-  // Spawn disebar biar 14 Chrome tidak dinyalakan bersamaan (beban + pola bot).
+  // Fisher-Yates shuffle supaya urutan akun tidak selalu sama.
+  for (let i = pending.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pending[i], pending[j]] = [pending[j], pending[i]];
+  }
+
+  startAllQueue.push(...pending);
+  startAllGeneration++;
+  const gen = startAllGeneration;
   await ctx.reply(
-    `▶️ Memulai ${pending.length} akun dengan jeda ${Math.round(
-      START_ALL_STAGGER_MS / 1000
-    )} detik per akun...`
+    `?? ${pending.length} akun masuk antrean — urutan acak, jeda 2-10 menit per start, ` +
+      `maksimal ${POST_CONCURRENCY} akun posting bersamaan.\n` +
+      `Urutan: ${pending.join(", ")}`
   );
 
   void (async () => {
-    const out: string[] = [];
-    for (let i = 0; i < pending.length; i++) {
-      if (shutdownStarted) break; // dashboard sedang mati → jangan spawn baru
-      out.push(await startWorker(pending[i]));
-      if (i < pending.length - 1) await sleep(START_ALL_STAGGER_MS);
-    }
-    if (chatId && out.length && !shutdownStarted) {
+    const generation = gen;
+    while (
+      generation === startAllGeneration &&
+      startAllQueue.length > 0 &&
+      !shutdownStarted
+    ) {
+      if (activePostingCount() >= POST_CONCURRENCY) {
+        await sleep(30_000);
+        continue;
+      }
+      const id = startAllQueue.shift()!;
+      const stagger =
+        START_ALL_STAGGER_MIN_MS +
+        Math.floor(Math.random() * (START_ALL_STAGGER_MAX_MS - START_ALL_STAGGER_MIN_MS));
+      await sleep(stagger);
+      if (generation !== startAllGeneration || shutdownStarted) break;
+      if (workers.has(id)) continue;
       try {
-        await bot.telegram.sendMessage(chatId, out.join("\n"));
-      } catch {}
+        console.log(await startWorker(id));
+      } catch (err) {
+        console.error(`Gagal start ${id} dari antrean:`, err);
+      }
     }
   })();
 });
@@ -943,12 +1547,228 @@ bot.action("summary", async (ctx) => {
 bot.action("stopall", async (ctx) => {
   if (!auth(ctx)) return void ctx.answerCbQuery("Akses ditolak", { show_alert: true });
   await ctx.answerCbQuery("Stopping all...");
+  startAllQueue = [];
+  startAllGeneration++;
   await ctx.reply(await stopAll());
+});
+
+// ─── Batch konten ────────────────────────────────────────────────────────────
+async function cancelBatchDraft(ctx: Context): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+  const draft = getBatchDraft(chatId);
+  if (!draft) {
+    batchDrafts.delete(chatId);
+    return void ctx.reply("ℹ️ Tidak ada proses tambah batch yang aktif.");
+  }
+  batchDrafts.delete(chatId);
+  if (draft.step === "caption") {
+    await fs.rm(draft.file, { force: true }).catch(() => {});
+  }
+  await ctx.reply("❌ Tambah batch dibatalkan.");
+}
+
+// Draft menua otomatis supaya tidak "nyangkut" kalau admin berhenti di tengah.
+function getBatchDraft(chatId: number): BatchDraft | null {
+  const draft = batchDrafts.get(chatId);
+  if (!draft) return null;
+  if (Date.now() - draft.at > BATCH_DRAFT_TTL_MS) {
+    batchDrafts.delete(chatId);
+    if (draft.step === "caption") void fs.rm(draft.file, { force: true }).catch(() => {});
+    return null;
+  }
+  return draft;
+}
+
+bot.command("batch", async (ctx) => {
+  if (!auth(ctx)) return void ctx.reply("⛔ Akses ditolak.");
+  await replyBatchManager(ctx);
+});
+
+bot.action("batch", async (ctx) => {
+  if (!auth(ctx)) return void ctx.answerCbQuery("Akses ditolak", { show_alert: true });
+  await ctx.answerCbQuery();
+  await replyBatchManager(ctx);
+});
+
+bot.action(/^batchpage:(\d+)$/, async (ctx) => {
+  if (!auth(ctx)) return void ctx.answerCbQuery("Akses ditolak", { show_alert: true });
+  await ctx.answerCbQuery();
+  await replyBatchManager(ctx, Number(ctx.match[1]));
+});
+
+bot.action("batchadd", async (ctx) => {
+  if (!auth(ctx)) return void ctx.answerCbQuery("Akses ditolak", { show_alert: true });
+  const ids = await accounts();
+  if (!ids.length) return void ctx.answerCbQuery("Belum ada akun", { show_alert: true });
+  if (batchMutation) {
+    return void ctx.answerCbQuery("Operasi batch lain sedang berjalan", { show_alert: true });
+  }
+  await ctx.answerCbQuery();
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+  const old = batchDrafts.get(chatId);
+  if (old?.step === "caption") await fs.rm(old.file, { force: true }).catch(() => {});
+  batchDrafts.set(chatId, { step: "photo", at: Date.now() });
+  await ctx.replyWithHTML(
+    batchAddPrompt(),
+    Markup.inlineKeyboard([[Markup.button.callback("❌ Batal", "batchcancel")]])
+  );
+});
+
+bot.action("batchcancel", async (ctx) => {
+  if (!auth(ctx)) return void ctx.answerCbQuery("Akses ditolak", { show_alert: true });
+  await ctx.answerCbQuery();
+  await cancelBatchDraft(ctx);
+});
+
+bot.command("batal", async (ctx) => {
+  if (!auth(ctx)) return void ctx.reply("⛔ Akses ditolak.");
+  await cancelBatchDraft(ctx);
+});
+
+bot.action(/^batchdel:(\d+)$/, async (ctx) => {
+  if (!auth(ctx)) return void ctx.answerCbQuery("Akses ditolak", { show_alert: true });
+  const n = Number(ctx.match[1]);
+  await ctx.answerCbQuery();
+  const active = activeWorkerIds();
+  if (active.length) {
+    return void ctx.reply(
+      `⛔ Stop dulu semua worker (${active.join(", ")}).\nHapus batch menggeser nomor batch lain, jadi tidak bisa saat worker aktif.`
+    );
+  }
+  await ctx.replyWithHTML(
+    [
+      `⚠️ <b>Hapus Batch ${n}?</b>`,
+      "",
+      "Folder konten batch ini akan dihapus dari semua akun.",
+      "Nomor batch setelahnya digeser agar tetap berurutan 1, 2, 3, dst.",
+      "Postingan yang sudah tayang di Facebook tidak terhapus.",
+    ].join("\n"),
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback("✅ Ya, hapus", `batchdelok:${n}`),
+        Markup.button.callback("❌ Batal", "batch"),
+      ],
+    ])
+  );
+});
+
+bot.action(/^batchdelok:(\d+)$/, async (ctx) => {
+  if (!auth(ctx)) return void ctx.answerCbQuery("Akses ditolak", { show_alert: true });
+  const n = Number(ctx.match[1]);
+  await ctx.answerCbQuery("Menghapus...");
+  if (batchMutation) {
+    return void ctx.reply("⏳ Operasi batch lain sedang berjalan. Coba lagi sebentar.");
+  }
+  const active = activeWorkerIds();
+  if (active.length) {
+    return void ctx.reply(
+      `⛔ Stop dulu semua worker (${active.join(", ")}).\nHapus batch menggeser nomor batch lain, jadi tidak bisa saat worker aktif.`
+    );
+  }
+
+  batchMutation = true;
+  try {
+    const result = await deleteBatchFromAll(n);
+    const lines = [
+      `🗑 <b>Batch ${n}</b> dihapus dari ${result.ok.length} akun.`,
+    ];
+    if (result.failed.length) {
+      lines.push(`⚠️ Gagal: ${esc(result.failed.join(", "))}`);
+      lines.push("Nomor batch tidak digeser. Ulangi hapus setelah masalahnya beres.");
+    } else {
+      const total = (await allBatchNumbers()).length;
+      lines.push(
+        total
+          ? `📦 Sisa ${total} batch, nomor dirapikan 1..${total}.`
+          : "📦 Semua batch kosong. Batch baru akan mulai dari nomor 1."
+      );
+    }
+    await ctx.replyWithHTML(
+      lines.join("\n"),
+      Markup.inlineKeyboard([[Markup.button.callback("📦 Lihat Batch", "batch")]])
+    );
+  } catch (err) {
+    await ctx.reply(
+      `❌ Gagal menghapus batch: ${String((err as Error)?.message ?? err).slice(0, 200)}`
+    );
+  } finally {
+    batchMutation = false;
+  }
+});
+
+function extFromMime(mime: string): string | null {
+  switch (mime.toLowerCase()) {
+    case "image/png":
+      return ".png";
+    case "image/jpeg":
+      return ".jpg";
+    case "image/gif":
+      return ".gif";
+    case "image/webp":
+      return ".webp";
+    default:
+      return null;
+  }
+}
+
+bot.on(message("photo"), async (ctx) => {
+  if (!auth(ctx)) return;
+  const draft = getBatchDraft(ctx.chat.id);
+  if (draft?.step !== "photo") return;
+  const photo = ctx.message.photo.at(-1);
+  if (!photo) return;
+  if (photo.file_size && photo.file_size > 20 * 1024 * 1024) {
+    return void ctx.reply("❌ Ukuran gambar melebihi batas Telegram (20 MB).");
+  }
+  try {
+    await handleBatchImage(ctx, photo.file_id, ".jpg", ctx.message.caption ?? "");
+  } catch (err) {
+    const reason = String((err as Error)?.message ?? err).slice(0, 200);
+    await ctx.reply(`❌ Gagal mengambil gambar: ${reason}\nCoba kirim ulang.`);
+  }
+});
+
+bot.on(message("document"), async (ctx) => {
+  if (!auth(ctx)) return;
+  const draft = getBatchDraft(ctx.chat.id);
+  if (draft?.step !== "photo") return;
+  const doc = ctx.message.document;
+  const mime = doc.mime_type ?? "";
+  if (!mime.startsWith("image/")) {
+    return void ctx.reply("❌ File harus berupa gambar (png/jpg/jpeg/gif/webp).");
+  }
+  if (doc.file_size && doc.file_size > 20 * 1024 * 1024) {
+    return void ctx.reply("❌ Ukuran file melebihi batas Telegram (20 MB).");
+  }
+  const extFromName = path.extname(doc.file_name ?? "").toLowerCase();
+  const ext = IMAGE_EXTENSIONS.has(extFromName) ? extFromName : extFromMime(mime);
+  if (!ext) {
+    return void ctx.reply("❌ Tipe gambar tidak didukung. Gunakan png/jpg/jpeg/gif/webp.");
+  }
+  try {
+    await handleBatchImage(ctx, doc.file_id, ext, ctx.message.caption ?? "");
+  } catch (err) {
+    const reason = String((err as Error)?.message ?? err).slice(0, 200);
+    await ctx.reply(`❌ Gagal mengambil file: ${reason}\nCoba kirim ulang.`);
+  }
+});
+
+// Harus didaftarkan setelah semua bot.command agar command tidak tertelan.
+bot.on(message("text"), async (ctx) => {
+  if (!auth(ctx)) return;
+  const draft = getBatchDraft(ctx.chat.id);
+  if (draft?.step !== "caption") return;
+  const text = ctx.message.text.trim();
+  if (!text || text.startsWith("/")) return;
+  await finalizeBatchDraft(ctx, ctx.chat.id, draft, text);
 });
 
 bot.catch((err) => console.error("Telegram bot error:", err));
 
 async function updatePeriodicMessage() {
+  await staleSessionsReady;
   const adminId = Number([...ADMIN_IDS][0]);
   if (!Number.isFinite(adminId)) return;
 
@@ -969,7 +1789,13 @@ async function updatePeriodicMessage() {
       );
       return;
     }
-  } catch {
+  } catch (err) {
+    // Teks/tombol tidak berubah → Telegram menolak edit dengan pesan ini.
+    // Bukan kegagalan; jangan kirim pesan baru (bikin duplikat tiap interval).
+    const desc = String(
+      (err as { description?: string })?.description ?? (err as Error)?.message ?? err
+    );
+    if (/message is not modified/i.test(desc)) return;
     periodicMessage = null;
   }
 
@@ -981,7 +1807,13 @@ async function updatePeriodicMessage() {
 }
 
 const PERIODIC_MS = 15 * 60 * 1000;
-setInterval(() => void updatePeriodicMessage(), PERIODIC_MS);
+setInterval(
+  () =>
+    void updatePeriodicMessage().catch((err) =>
+      console.error("Gagal update dashboard periodik:", err)
+    ),
+  PERIODIC_MS
+);
 
 // ─── Watchdog: deteksi worker hang ───────────────────────────────────────────
 // Worker RUNNING tetapi log.txt tidak pernah ditulis dalam HANG_TOLERANCE_MS →
@@ -1027,17 +1859,60 @@ async function shutdown(signal: "SIGINT" | "SIGTERM") {
 // tanpa ujung) → code di .then() tidak pernah jalan selama bot sehat. Semua
 // "bot siap" logic harus di callback launch() (jalan habis getMe).
 let onLaunchLogged = false;
-bot.launch(() => {
+void (async () => {
+  const normalized = await normalizeBatchNumbers().catch((err) => {
+    console.error("Gagal merapikan nomor batch:", err);
+    return { changed: false, failed: [] as string[] };
+  });
+  if (normalized.changed) {
+    const nums = await allBatchNumbers();
+    console.log(`📦 Nomor batch dirapikan menjadi 1..${nums.length}.`);
+  }
+  if (normalized.failed.length) {
+    console.error(`⚠️ Sebagian batch gagal dirapikan: ${normalized.failed.join(", ")}`);
+  }
+  bot.launch(() => {
   if (onLaunchLogged) return;
   onLaunchLogged = true;
   console.log("🤖 Telegram Dashboard v3 aktif.");
   console.log("📊 Pagination: 10 akun per halaman.");
   console.log("⏱️ Status otomatis setiap 15 menit.");
   console.log("📊 Ringkasan harian: /ringkasan atau tombol 📊 Ringkasan.");
+  console.log("➕ Join grup: tombol di detail akun atau /join <akun>.");
   console.log(
     `🛟 Watchdog hang aktif (log diam > ${HANG_TOLERANCE_MS / 60000} menit), auto-restart maks ${RESTART_MAX_FAILURES}x dengan backoff.`
   );
-  setTimeout(() => void updatePeriodicMessage(), 3000);
+  void bot.telegram
+    .setMyCommands([
+      { command: "start", description: "Buka dashboard" },
+      { command: "status", description: "Status semua akun" },
+      { command: "join", description: "Join grup: /join fb05" },
+      { command: "collect", description: "Kumpulkan grup: /collect fb05" },
+      { command: "ringkasan", description: "Ringkasan harian" },
+    ])
+    .catch((err) => console.error("Gagal set menu command:", err));
+  setTimeout(
+    () =>
+      void updatePeriodicMessage().catch((err) =>
+        console.error("Gagal kirim dashboard awal:", err)
+      ),
+    3000
+  );
+  // Auto-start akun dari env AUTOSTART (koma-dipisah) dengan stagger
+  // START_ALL_STAGGER_MS — untuk menjalankan akun tanpa klik manual.
+  const autostartIds = (process.env.AUTOSTART ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => /^[A-Za-z0-9_-]+$/.test(s));
+  if (autostartIds.length) {
+    void (async () => {
+      for (let i = 0; i < autostartIds.length; i++) {
+        if (shutdownStarted) break;
+        console.log(await startWorker(autostartIds[i], true));
+        if (i < autostartIds.length - 1) await sleep(START_ALL_STAGGER_MS);
+      }
+    })();
+  }
   if (TEST_MODE) {
     console.log("[TEST] TEST_MODE aktif — self-test berjalan otomatis.");
     setTimeout(() => void runSelfTest(), 2000);
@@ -1049,6 +1924,7 @@ bot.launch(() => {
     console.error("❌ Telegram launch gagal — dashboard berhenti:", err);
     process.exit(1);
   });
+})();
 // Rangkaian uji stabilitas yang memakai jalur kode dashboard asli (start/stop/
 // auto-restart/watchdog) terhadap akun uji sementara. fbtest = pakai sesi fb01,
 // fbtest2 = tanpa sesi (mensimulasikan hang). Hasil ditulis ke test-results.txt.
