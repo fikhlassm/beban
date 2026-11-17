@@ -108,6 +108,57 @@ interface RuntimeState {
   daily: Record<string, number>;      // tanggal "YYYY-MM-DD" → durasi run (ms)
 }
 
+// Marker istirahat yang ditulis worker sebelum exit (accounts/<id>/break.json).
+interface BreakInfo {
+  until: string;
+  batch: number;
+  groupIdx: number;
+  startedAt: string;
+}
+
+function breakFile(id: string): string {
+  return path.join(ACCOUNTS_DIR, id, "break.json");
+}
+
+async function readBreak(id: string): Promise<BreakInfo | null> {
+  return readJson<BreakInfo>(breakFile(id));
+}
+
+function breakUntilMs(info: BreakInfo | null): number {
+  const ms = info ? Date.parse(info.until) : NaN;
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+async function clearBreak(id: string): Promise<void> {
+  await fs.rm(breakFile(id), { force: true }).catch(() => {});
+}
+
+function fmtClock(ms: number): string {
+  return new Date(ms).toLocaleTimeString("id-ID", {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+// Jadwalkan wake dari istirahat; beri tahu admin bila start-nya gagal.
+function scheduleBreakWake(id: string, until: number): void {
+  restartTimers.set(
+    id,
+    setTimeout(() => {
+      restartTimers.delete(id);
+      void (async () => {
+        const msg = await startWorker(id, false, "", true);
+        console.log(msg);
+        if (!workers.has(id) && !starting.has(id) && !restartTimers.has(id)) {
+          await sendToAdmins(
+            `<b>${esc(id)}</b> gagal lanjut setelah istirahat: ${esc(msg)}`
+          );
+        }
+      })();
+    }, Math.max(0, until - Date.now()))
+  );
+}
+
 function isAdmin(id: number): boolean {
   return ADMIN_IDS.has(String(id));
 }
@@ -118,6 +169,23 @@ function esc(value: string): string {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function stripEmoji(text: string): string {
+  return text.replace(/\p{Extended_Pictographic}|\uFE0F|\u200D/gu, "");
+}
+
+function breakdownText(d: DailyStat | null | undefined): string {
+  if (!d) return "";
+  return [
+    d.direct ? `ok ${d.direct}` : "",
+    d.pending ? `pending ${d.pending}` : "",
+    d.limited ? `limit ${d.limited}` : "",
+    d.error ? `error ${d.error}` : "",
+    d.unknown ? `unknown ${d.unknown}` : "",
+  ]
+    .filter(Boolean)
+    .join(", ");
 }
 
 async function readJson<T>(file: string): Promise<T | null> {
@@ -542,7 +610,7 @@ function normalizeBatchPage(page: number, total: number): number {
 async function batchManagerText(page: number): Promise<string> {
   const nums = await allBatchNumbers();
   if (!nums.length) {
-    return "📦 <b>BATCH KONTEN</b>\n\nBelum ada batch. Tekan ➕ Tambah Batch untuk mengisi konten pertama.";
+    return "<b>BATCH KONTEN</b>\n\nBelum ada batch. Tekan Tambah Batch untuk mengisi konten pertama.";
   }
 
   const safe = normalizeBatchPage(page, nums.length);
@@ -550,8 +618,8 @@ async function batchManagerText(page: number): Promise<string> {
   const summaries = await Promise.all(visible.map(batchSummary));
 
   const lines = [
-    "📦 <b>BATCH KONTEN</b>",
-    `📄 Halaman <b>${safe + 1}/${batchPageCount(nums.length)}</b> • ${nums.length} batch`,
+    "<b>BATCH KONTEN</b>",
+    `Halaman <b>${safe + 1}/${batchPageCount(nums.length)}</b> • ${nums.length} batch`,
     "━━━━━━━━━━━━━━━━━━━━",
   ];
   for (const b of summaries) {
@@ -576,20 +644,20 @@ async function batchManagerKeyboard(page: number) {
     rows.push(
       visible
         .slice(i, i + 5)
-        .map((n) => Markup.button.callback(`🗑 B${n}`, `batchdel:${n}`))
+        .map((n) => Markup.button.callback(`Hapus B${n}`, `batchdel:${n}`))
     );
   }
 
   const nav = [];
-  if (safe > 0) nav.push(Markup.button.callback("⬅ Prev", `batchpage:${safe - 1}`));
+  if (safe > 0) nav.push(Markup.button.callback("Prev", `batchpage:${safe - 1}`));
   if (nums.length) nav.push(Markup.button.callback(`${safe + 1}/${batchPageCount(nums.length)}`, "noop"));
   if (safe < batchPageCount(nums.length) - 1) {
-    nav.push(Markup.button.callback("Next ➡", `batchpage:${safe + 1}`));
+    nav.push(Markup.button.callback("Next", `batchpage:${safe + 1}`));
   }
   if (nav.length) rows.push(nav);
 
-  rows.push([Markup.button.callback("➕ Tambah Batch", "batchadd")]);
-  rows.push([Markup.button.callback("⬅ Dashboard", "dashboard")]);
+  rows.push([Markup.button.callback("Tambah Batch", "batchadd")]);
+  rows.push([Markup.button.callback("Dashboard", "dashboard")]);
   return Markup.inlineKeyboard(rows);
 }
 
@@ -604,7 +672,7 @@ async function replyBatchManager(ctx: Context, page = 0): Promise<void> {
 
 function batchAddPrompt(): string {
   return [
-    "➕ <b>TAMBAH BATCH KONTEN</b>",
+    "<b>TAMBAH BATCH KONTEN</b>",
     "",
     "Kirim 1 foto atau file gambar + caption dalam satu pesan.",
     "Gambar dan caption akan dipakai semua akun.",
@@ -622,7 +690,7 @@ async function finalizeBatchDraft(
   if (batchMutation) {
     batchDrafts.delete(chatId);
     await fs.rm(draft.file, { force: true }).catch(() => {});
-    await ctx.reply("⏳ Operasi batch lain sedang berjalan. Coba kirim lagi sebentar.");
+    await ctx.reply("Operasi batch lain sedang berjalan. Coba kirim lagi sebentar.");
     return;
   }
 
@@ -635,25 +703,25 @@ async function finalizeBatchDraft(
       throw new Error("tidak ada akun yang berhasil ditulis");
     }
     const lines = [
-      `✅ <b>Batch ${n}</b> ditambahkan ke ${result.ok.length}/${result.ok.length + result.failed.length} akun.`,
-      `🖼 1 gambar • caption ${caption.trim().split(/\r?\n/).length} baris`,
+      `<b>Batch ${n}</b> ditambahkan ke ${result.ok.length}/${result.ok.length + result.failed.length} akun.`,
+      `1 gambar • caption ${caption.trim().split(/\r?\n/).length} baris`,
     ];
     if (result.failed.length) {
-      lines.push(`⚠️ Gagal: ${esc(result.failed.join(", "))}`);
+      lines.push(`Gagal: ${esc(result.failed.join(", "))}`);
     }
     if (workers.size) {
       lines.push(
         "",
-        "ℹ️ Worker yang sedang berjalan perlu di-restart agar batch ini ikut diproses sesi ini."
+        "Worker yang sedang berjalan perlu di-restart agar batch ini ikut diproses sesi ini."
       );
     }
     await ctx.replyWithHTML(
       lines.join("\n"),
-      Markup.inlineKeyboard([[Markup.button.callback("📦 Lihat Batch", "batch")]])
+      Markup.inlineKeyboard([[Markup.button.callback("Lihat Batch", "batch")]])
     );
   } catch (err) {
     await ctx.reply(
-      `❌ Gagal menambah batch: ${String((err as Error)?.message ?? err).slice(0, 200)}`
+      `Gagal menambah batch: ${String((err as Error)?.message ?? err).slice(0, 200)}`
     );
   } finally {
     batchMutation = false;
@@ -676,7 +744,7 @@ async function handleBatchImage(
   }
   batchDrafts.set(chatId, { step: "caption", file: staged.file, ext: staged.ext, at: Date.now() });
   await ctx.reply(
-    "🖼 Gambar diterima. Sekarang kirim teks caption (boleh multi-baris).\nKetik /batal untuk membatalkan."
+    "Gambar diterima. Sekarang kirim teks caption (boleh multi-baris).\nKetik /batal untuk membatalkan."
   );
 }
 
@@ -725,14 +793,16 @@ interface JoinProgress {
 
 async function statusOf(id: string) {
   const running = workers.has(id);
-  const [progress, config, logInfo, stats, runtime, joinProgress] = await Promise.all([
-    readJson<Progress>(path.join(ACCOUNTS_DIR, id, "progress.json")),
-    readJson<Config>(path.join(ACCOUNTS_DIR, id, "config.json")),
-    readLogInfo(id),
-    readJson<PostingStats>(path.join(ACCOUNTS_DIR, id, "posting-stats.json")),
-    readRuntime(id),
-    readJson<JoinProgress>(path.join(ACCOUNTS_DIR, id, "join-progress.json")),
-  ]);
+  const [progress, config, logInfo, stats, runtime, joinProgress, breakInfo] =
+    await Promise.all([
+      readJson<Progress>(path.join(ACCOUNTS_DIR, id, "progress.json")),
+      readJson<Config>(path.join(ACCOUNTS_DIR, id, "config.json")),
+      readLogInfo(id),
+      readJson<PostingStats>(path.join(ACCOUNTS_DIR, id, "posting-stats.json")),
+      readRuntime(id),
+      readJson<JoinProgress>(path.join(ACCOUNTS_DIR, id, "join-progress.json")),
+      readBreak(id),
+    ]);
   const log = logInfo.last;
   const limitReason = detectLimit(logInfo.sessionText);
   const mode = workerModes.get(id) ?? "";
@@ -740,6 +810,8 @@ async function statusOf(id: string) {
 
   let icon = running ? "🟢" : "🔴";
   let state = running ? "RUNNING" : "STOPPED";
+  const breakUntil = breakUntilMs(breakInfo);
+  const resting = !running && breakUntil > Date.now();
 
   if (limitReason) {
     icon = "🚫";
@@ -750,6 +822,9 @@ async function statusOf(id: string) {
   } else if (running && mode === "collect") {
     icon = "🧲";
     state = "COLLECT GRUP";
+  } else if (resting) {
+    icon = "😴";
+    state = `ISTIRAHAT • lanjut ${fmtClock(breakUntil)}`;
   } else if (!running && /semua batch selesai/i.test(log)) {
     icon = "🔵";
     state = "COMPLETED";
@@ -767,7 +842,7 @@ async function statusOf(id: string) {
     mode === "join" && joinProgress
       ? `Join ${joinProgress.index}/${poolTotal}`
       : completed
-        ? "✅ Selesai"
+        ? "Selesai"
         : progress
           ? `B${progress.batch} • G${progress.groupIdx + 1}`
           : "B1 • G1";
@@ -794,6 +869,7 @@ async function statusOf(id: string) {
     limitReason,
     running,
     sessionMs,
+    breakUntil: resting ? breakUntil : null,
     postsTotal: stats?.total ?? 0,
     postsToday: stats?.daily?.[todayKey()] ?? null,
     joinProgress: joinProgress
@@ -827,69 +903,70 @@ function dashboardKeyboard(ids: string[], page: number) {
   for (const id of slice) {
     const label = id.length > 14 ? id.slice(0, 14) : id;
     rows.push([
-      Markup.button.callback(`📱 ${label}`, `view:${id}`),
-      Markup.button.callback("▶", `start:${id}`),
-      Markup.button.callback("⏹", `stop:${id}`),
+      Markup.button.callback(label, `view:${id}`),
+      Markup.button.callback("Start", `start:${id}`),
+      Markup.button.callback("Stop", `stop:${id}`),
     ]);
   }
 
   const nav = [];
-  if (safePage > 0) nav.push(Markup.button.callback("⬅ Prev", `page:${safePage - 1}`));
+  if (safePage > 0) nav.push(Markup.button.callback("Prev", `page:${safePage - 1}`));
   nav.push(Markup.button.callback(`${safePage + 1}/${totalPages}`, "noop"));
-  if (safePage < totalPages - 1) nav.push(Markup.button.callback("Next ➡", `page:${safePage + 1}`));
+  if (safePage < totalPages - 1) nav.push(Markup.button.callback("Next", `page:${safePage + 1}`));
   rows.push(nav);
 
   rows.push([
-    Markup.button.callback("▶ Start All", "startall"),
-    Markup.button.callback("⏹ Stop All", "stopall"),
+    Markup.button.callback("Start All", "startall"),
+    Markup.button.callback("Stop All", "stopall"),
   ]);
+  rows.push([Markup.button.callback("Start Non-Limit (serentak)", "startnonlimit")]);
   rows.push([
-    Markup.button.callback("🔄 Refresh", `page:${safePage}`),
-    Markup.button.callback("📊 Ringkasan", "summary"),
+    Markup.button.callback("Refresh", `page:${safePage}`),
+    Markup.button.callback("Ringkasan", "summary"),
   ]);
-  rows.push([Markup.button.callback("📦 Batch Konten", "batch")]);
+  rows.push([Markup.button.callback("Batch Konten", "batch")]);
 
   return Markup.inlineKeyboard(rows);
 }
 
 function accountKeyboard(id: string) {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("▶ START / RESUME", `start:${id}`), Markup.button.callback("⏹ STOP", `stop:${id}`)],
-    [Markup.button.callback("➕ Join Grup", `join:${id}`), Markup.button.callback("♻️ Reset Join", `resetjoin:${id}`)],
-    [Markup.button.callback("🔄 STATUS", `view:${id}`)],
-    [Markup.button.callback("⬅ Dashboard", "dashboard")],
+    [Markup.button.callback("START / RESUME", `start:${id}`), Markup.button.callback("STOP", `stop:${id}`)],
+    [Markup.button.callback("Join Grup", `join:${id}`), Markup.button.callback("Reset Join", `resetjoin:${id}`)],
+    [Markup.button.callback("STATUS", `view:${id}`)],
+    [Markup.button.callback("Dashboard", "dashboard")],
   ]);
 }
 
 async function dashboardText(page: number): Promise<string> {
   const ids = await accounts();
-  if (!ids.length) return "🤖 <b>FACEBOOK DASHBOARD</b>\n\n❌ Tidak ada akun di accounts/.";
+  if (!ids.length) return "<b>FACEBOOK DASHBOARD</b>\n\nTidak ada akun di accounts/.";
 
   const safe = normalizePage(page, ids.length);
   const visible = ids.slice(safe * PAGE_SIZE, safe * PAGE_SIZE + PAGE_SIZE);
   const data = await Promise.all(visible.map(statusOf));
 
   const lines = [
-    "🤖 <b>FACEBOOK DASHBOARD</b>",
-    `📄 Halaman <b>${safe + 1}/${pageCount(ids.length)}</b> • ${ids.length} akun`,
+    "<b>FACEBOOK DASHBOARD</b>",
+    `Halaman <b>${safe + 1}/${pageCount(ids.length)}</b> • ${ids.length} akun`,
     "━━━━━━━━━━━━━━━━━━━━",
   ];
 
   for (const a of data) {
     lines.push(
       `${a.icon} <b>${esc(a.id)}</b> — ${esc(a.state)}`,
-      `   📦 ${esc(a.position)}`
+      `   Progress: ${esc(a.position)}`
     );
-    const dur = a.running ? `⏱ ${fmtDuration(a.sessionMs)}` : "⏱ —";
-    const today = a.postsToday ? ` • ${a.postsToday.total} hari ini` : "";
-    lines.push(`   ${dur} • 📤 ${a.postsTotal} post${today}`);
-    if (a.limitReason) lines.push(`   🚫 ${esc(a.limitReason)}`);
+    const dur = a.running ? `Sesi: ${fmtDuration(a.sessionMs)}` : "Sesi: -";
+    const today = a.postsToday ? ` • Hari ini: ${a.postsToday.total}` : "";
+    lines.push(`   ${dur} • Total: ${a.postsTotal} post${today}`);
+    if (a.limitReason) lines.push(`   Limit: ${esc(a.limitReason)}`);
   }
 
   lines.push(
     "",
-    "🟢 Running  •  🔴 Stopped  •  🚫 Limit/Blocked (sesi terakhir)  •  🔵 Completed",
-    "⏱️ Status otomatis diperbarui setiap 15 menit."
+    "Status: 🟢 Running • 🔴 Stopped • 😴 Istirahat • 🚫 Limit • 🔵 Completed",
+    "Diperbarui otomatis setiap 15 menit."
   );
 
   return lines.join("\n");
@@ -897,7 +974,7 @@ async function dashboardText(page: number): Promise<string> {
 
 async function replyDashboard(ctx: Context, page = 0) {
   if (!ctx.from || !isAdmin(ctx.from.id)) {
-    await ctx.reply("⛔ Akses ditolak.");
+    await ctx.reply("Akses ditolak.");
     return;
   }
 
@@ -953,10 +1030,12 @@ async function handleWorkerExit(id: string, exitInfo: string): Promise<void> {
   // di-flush ke log.txt sebelum dibaca oleh statusOf().
   await sleep(800);
 
-  const [data, stats] = await Promise.all([
+  const [data, stats, breakInfo] = await Promise.all([
     statusOf(id),
     readJson<PostingStats>(path.join(ACCOUNTS_DIR, id, "posting-stats.json")),
+    readBreak(id),
   ]);
+  const breakUntil = breakUntilMs(breakInfo);
   const sessionPosts = session
     ? Math.max(0, (stats?.total ?? 0) - session.startTotal)
     : 0;
@@ -968,45 +1047,41 @@ async function handleWorkerExit(id: string, exitInfo: string): Promise<void> {
   const wasSupervised = supervisedRestart.delete(id);
   const workerMode = workerModes.get(id) ?? "";
   workerModes.delete(id);
+  const onBreak = !wasManual && !wasSupervised && breakUntil > now;
 
-  let icon = "⚠️";
   let reason = `Berhenti tak terduga (${exitInfo}). Cek log untuk detail.`;
 
   if (workerMode === "join") {
-    icon = "➕";
     reason = "Sesi join grup selesai (detail di join-progress.json).";
   } else if (workerMode === "collect") {
-    icon = "🧲";
     reason = "Sesi kumpul grup selesai (hasil di groups-pool.txt).";
   } else if (data.state === "LIMIT / BLOCKED") {
-    icon = "🚫";
     reason = "Terkena limit / pembatasan posting dari Facebook.";
   } else if (data.state === "COMPLETED") {
-    icon = "🎉";
     reason = "Semua batch sudah selesai diproses.";
   } else if (data.state === "SETUP ERROR") {
-    icon = "⚙️";
     reason = "Setup tidak lengkap (grup/konten tidak ditemukan) — perlu diberi konten atau join grup dulu.";
   } else if (wasManual) {
-    icon = "⏹";
     reason = "Dihentikan manual lewat dashboard/perintah STOP.";
   } else if (wasSupervised) {
-    icon = "🥴";
     reason = "Log diam terlalu lama (indikasi hang) — dihentikan untuk restart terawasi.";
+  } else if (onBreak) {
+    reason = `Istirahat manusiawi — lanjut otomatis pukul ${fmtClock(breakUntil)}.`;
   }
+  if (wasManual) await clearBreak(id);
 
   const lines = [
-    `${icon} <b>${esc(data.name)}</b> berhenti`,
+    `${data.icon} <b>${esc(data.name)}</b> ${onBreak ? "istirahat" : "berhenti"}`,
     `Alasan: ${esc(reason)}`,
     `Progress: ${esc(data.position)}`,
   ];
   if (session) {
     lines.push(
-      `⏱ Berjalan ${fmtDuration(sessionMs)} • 📤 ${sessionPosts} posting sesi ini`
+      `Durasi: ${fmtDuration(sessionMs)} • Posting sesi ini: ${sessionPosts}`
     );
   }
   if (data.log) {
-    lines.push(`Log terakhir: <code>${esc(data.log.slice(-500))}</code>`);
+    lines.push(`Log terakhir: <code>${esc(stripEmoji(data.log.slice(-500)))}</code>`);
   }
 
   if (!shutdownStarted) {
@@ -1019,6 +1094,15 @@ async function handleWorkerExit(id: string, exitInfo: string): Promise<void> {
   if (shutdownStarted || wasManual) return;
   // collect/join bukan proses posting — jangan pernah auto-restart.
   if (workerMode) return;
+
+  // Istirahat: jadwalkan wake tepat waktu dengan resume progress (bukan backoff).
+  if (onBreak) {
+    failCount.delete(id);
+    scheduleBreakWake(id, breakUntil);
+    pumpStartAllQueue();
+    return;
+  }
+
   if (
     data.state === "LIMIT / BLOCKED" ||
     data.state === "COMPLETED" ||
@@ -1035,7 +1119,7 @@ async function handleWorkerExit(id: string, exitInfo: string): Promise<void> {
     failCount.delete(id);
     if (!shutdownStarted) {
       await sendToAdmins(
-        `🛑 <b>${esc(data.name)}</b> tetap bermasalah setelah ${RESTART_MAX_FAILURES} percobaan auto-restart. Tidak di-restart lagi — perlu diperiksa manual.`
+        `<b>${esc(data.name)}</b> tetap bermasalah setelah ${RESTART_MAX_FAILURES} percobaan auto-restart. Tidak di-restart lagi — perlu diperiksa manual.`
       );
     }
     return;
@@ -1045,7 +1129,7 @@ async function handleWorkerExit(id: string, exitInfo: string): Promise<void> {
   const delay = backoffDelayMs(fails);
   if (!shutdownStarted) {
     await sendToAdmins(
-      `🔄 <b>${esc(data.name)}</b> berhenti tak terduga → auto-restart dalam ${fmtDuration(delay)} (percobaan ${fails}/${RESTART_MAX_FAILURES}).`
+      `<b>${esc(data.name)}</b> berhenti tak terduga → auto-restart dalam ${fmtDuration(delay)} (percobaan ${fails}/${RESTART_MAX_FAILURES}).`
     );
   }
   restartTimers.set(
@@ -1060,12 +1144,17 @@ async function handleWorkerExit(id: string, exitInfo: string): Promise<void> {
   pumpStartAllQueue();
 }
 
-async function startWorker(id: string, resetFailures = true, mode = ""): Promise<string> {
+async function startWorker(
+  id: string,
+  resetFailures = true,
+  mode = "",
+  resumeAfterBreak = false
+): Promise<string> {
   // Bagian sinkron sebelum await — menutup race START cepat berulang.
-  if (starting.has(id) || workers.has(id)) return `⚠️ ${id} sudah berjalan.`;
+  if (starting.has(id) || workers.has(id)) return `${id} sudah berjalan.`;
   starting.add(id);
   try {
-    return await startWorkerInner(id, resetFailures, mode);
+    return await startWorkerInner(id, resetFailures, mode, resumeAfterBreak);
   } finally {
     starting.delete(id);
   }
@@ -1074,9 +1163,18 @@ async function startWorker(id: string, resetFailures = true, mode = ""): Promise
 async function startWorkerInner(
   id: string,
   resetFailures: boolean,
-  mode = ""
+  mode = "",
+  resumeAfterBreak = false
 ): Promise<string> {
   await staleSessionsReady; // jangan spawn sebelum sesi lama ditutup
+  if (!resumeAfterBreak && !mode) {
+    // Jangan spawn dini saat istirahat; timer wake yang ada tetap dipakai.
+    const breakUntil = breakUntilMs(await readBreak(id));
+    if (breakUntil > Date.now()) {
+      if (!restartTimers.has(id)) scheduleBreakWake(id, breakUntil);
+      return `😴 ${id} sedang istirahat — lanjut otomatis pukul ${fmtClock(breakUntil)} (sisa ${Math.max(1, Math.ceil((breakUntil - Date.now()) / 60000))} menit). Tekan STOP untuk membatalkan.`;
+    }
+  }
   cancelScheduledRestart(id, false); // restart terjadwal: hitungan kegagalan tetap
   if (resetFailures) failCount.delete(id); // start manual = siklus baru
   hangAlerted.delete(id);
@@ -1086,7 +1184,7 @@ async function startWorkerInner(
     await fs.access(WORKER_SCRIPT);
     await fs.access(TSX_CLI);
   } catch {
-    return `❌ Worker/dependency untuk ${id} tidak ditemukan.`;
+    return `Worker/dependency untuk ${id} tidak ditemukan.`;
   }
 
   const child = spawn(
@@ -1098,6 +1196,7 @@ async function startWorkerInner(
         ...process.env,
         DASHBOARD_MODE: "1",
         WORKER_LAUNCH_AT: String(Date.now()),
+        ...(resumeAfterBreak ? { RESUME_AFTER_BREAK: "1" } : {}),
       },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
@@ -1136,11 +1235,20 @@ async function startWorkerInner(
     void handleWorkerExit(id, `code=${code}, signal=${signal ?? "-"}`);
   });
 
+  if (resumeAfterBreak) {
+    const progress = await readJson<Progress>(
+      path.join(ACCOUNTS_DIR, id, "progress.json")
+    );
+    await sendToAdmins(
+      `<b>${esc(id)}</b> lanjut setelah istirahat${progress ? ` • B${progress.batch} G${progress.groupIdx + 1}` : ""}.`
+    );
+  }
+
   return mode === "join"
-    ? `➕ ${id}: mulai join grup dari groups-pool.txt (progress tersimpan di join-progress.json).`
+    ? `${id}: mulai join grup dari groups-pool.txt (progress tersimpan di join-progress.json).`
     : mode === "collect"
-      ? `🧲 ${id}: mulai kumpulkan grup ke groups-pool.txt.`
-      : `▶️ ${id} dimulai. Resume otomatis dari progress terakhir.`;
+      ? `${id}: mulai kumpulkan grup ke groups-pool.txt.`
+      : `${id} dimulai. Resume otomatis dari progress terakhir.`;
 }
 
 function isProcessAlive(child: ChildProcess): boolean {
@@ -1193,11 +1301,20 @@ async function stopWorkerInternal(
   manual: boolean
 ): Promise<{ stopped: boolean; graceful: boolean }> {
   const child = workers.get(id);
-  if (!child?.pid) return { stopped: false, graceful: true };
+  if (!child?.pid) {
+    // Tidak ada proses, tapi mungkin masih ada jadwal istirahat/auto-restart.
+    if (restartTimers.has(id) || (await readBreak(id))) {
+      cancelScheduledRestart(id);
+      await clearBreak(id);
+      return { stopped: true, graceful: true };
+    }
+    return { stopped: false, graceful: true };
+  }
 
   if (manual) {
     manualStops.add(id);
     cancelScheduledRestart(id);
+    await clearBreak(id);
   } else {
     supervisedRestart.add(id);
   }
@@ -1224,18 +1341,39 @@ async function stopWorkerInternal(
 }
 
 async function stopWorker(id: string): Promise<string> {
+  const hadChild = workers.has(id);
+  const hadBreak = breakUntilMs(await readBreak(id)) > 0;
+  const hadTimer = restartTimers.has(id);
   const result = await stopWorkerInternal(id, true);
-  if (!result.stopped) return `⚠️ ${id} tidak sedang berjalan.`;
+  if (!result.stopped) return `${id} tidak sedang berjalan.`;
+  if (!hadChild && hadBreak) return `${id}: jadwal istirahat dibatalkan.`;
+  if (!hadChild && hadTimer) return `${id}: jadwal auto-restart dibatalkan.`;
   return result.graceful
-    ? `⏹ ${id} dihentikan rapi (progress tersimpan).`
-    : `⏹ ${id} terpaksa dimatikan (tidak merespon stop.request).`;
+    ? `${id} dihentikan rapi (progress tersimpan).`
+    : `${id} terpaksa dimatikan (tidak merespon stop.request).`;
 }
 
 async function stopAll(): Promise<string> {
-  const ids = [...workers.keys()];
-  if (!ids.length) return "⚠️ Tidak ada worker aktif.";
+  const ids = [...new Set([...workers.keys(), ...restartTimers.keys()])];
+  if (!ids.length) return "Tidak ada worker aktif.";
   const results = await Promise.all(ids.map((id) => stopWorker(id)));
   return results.join("\n");
+}
+
+// Dashboard baru hidup: lanjutkan jadwal istirahat yang tercatat di disk.
+async function recoverBreakTimers(): Promise<void> {
+  for (const id of await accounts()) {
+    if (workers.has(id) || restartTimers.has(id)) continue;
+    const until = breakUntilMs(await readBreak(id));
+    if (!until) continue;
+    if (until <= Date.now()) {
+      console.log(`▶️ ${id}: jadwal istirahat sudah lewat — lanjut sekarang.`);
+      await startWorker(id, true, "", true);
+      continue;
+    }
+    scheduleBreakWake(id, until);
+    console.log(`😴 ${id}: istirahat sampai ${fmtClock(until)} — wake terjadwal.`);
+  }
 }
 
 function auth(ctx: Context): boolean {
@@ -1243,7 +1381,7 @@ function auth(ctx: Context): boolean {
 }
 
 bot.start(async (ctx) => {
-  if (!auth(ctx)) return void ctx.reply("⛔ Akses ditolak.");
+  if (!auth(ctx)) return void ctx.reply("Akses ditolak.");
   await replyDashboard(ctx, periodicPageByChat.get(ctx.chat?.id ?? 0) ?? 0);
 });
 
@@ -1255,7 +1393,7 @@ bot.command("status", async (ctx) => {
 // Mode grup: /collect <akun> mengumpulkan grup yang sudah di-join akun itu ke
 // groups-pool.txt; /join <akun> join grup dari file pool tersebut.
 async function startGroupMode(ctx: Context, mode: "collect" | "join"): Promise<void> {
-  if (!auth(ctx)) return void ctx.reply("⛔ Akses ditolak.");
+  if (!auth(ctx)) return void ctx.reply("Akses ditolak.");
   const text =
     "text" in (ctx.message ?? {})
       ? String((ctx.message as { text?: string }).text ?? "")
@@ -1263,7 +1401,7 @@ async function startGroupMode(ctx: Context, mode: "collect" | "join"): Promise<v
   const id = text.trim().split(/\s+/)[1] ?? "";
   if (!id) return void ctx.reply(`Format: /${mode} <akun>\nContoh: /${mode} fb11`);
   const ids = await accounts();
-  if (!ids.includes(id)) return void ctx.reply(`❌ Akun ${id} tidak ditemukan di accounts/.`);
+  if (!ids.includes(id)) return void ctx.reply(`Akun ${id} tidak ditemukan di accounts/.`);
   await ctx.reply(await startWorker(id, true, mode));
 }
 
@@ -1293,31 +1431,33 @@ bot.action(/^view:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const data = await statusOf(id);
   const d = data.postsToday;
+  const todayBreakdown = breakdownText(d);
 
   const lines = [
-    `📱 <b>${esc(data.id)}</b> — ${esc(data.state)}`,
+    `${data.icon} <b>${esc(data.id)}</b> — ${esc(data.state)}`,
     `Progress: ${esc(data.position)}`,
     data.limitReason
-      ? `Limit: 🚫 YA — "${esc(data.limitReason)}" (sesi terakhir)`
-      : `Limit: ✅ TIDAK`,
-    `Sesi: ${data.running ? `▶ berjalan ${fmtDuration(data.sessionMs)}` : "—"}`,
-    `Hari ini: 📤 ${
-      d ? d.total : 0
-    } post${
-      d
-        ? ` (✅${d.direct}${d.pending ? ` 🟡${d.pending}` : ""}${d.limited ? ` 🚫${d.limited}` : ""}${d.error ? ` ❌${d.error}` : ""}${d.unknown ? ` ❓${d.unknown}` : ""})`
-        : ""
-    } • ⏱ ${fmtDuration(runtimeTodayMs(data.runtime))}`,
-    `Total post: 📤 ${data.postsTotal}`,
+      ? `Limit: YA — "${esc(data.limitReason)}" (sesi terakhir)`
+      : `Limit: TIDAK`,
+    `Sesi: ${data.running ? `berjalan ${fmtDuration(data.sessionMs)}` : "—"}`,
+    `Hari ini: ${d?.total ?? 0} post${
+      todayBreakdown ? ` (${todayBreakdown})` : ""
+    } • ${fmtDuration(runtimeTodayMs(data.runtime))}`,
+    `Total post: ${data.postsTotal}`,
   ];
+  if (data.breakUntil) {
+    lines.push(
+      `Istirahat: sisa ${Math.max(1, Math.ceil((data.breakUntil - Date.now()) / 60000))} menit (lanjut ${fmtClock(data.breakUntil)})`
+    );
+  }
   if (data.joinProgress) {
     const jp = data.joinProgress;
-    lines.push(`Join grup: ${jp.index}/${jp.total} • ✅ ${jp.joined} • ❌ ${jp.failed}`);
+    lines.push(`Join grup: ${jp.index}/${jp.total} • ${jp.joined} ok • ${jp.failed} gagal`);
   }
-  if (data.mode === "join") lines.push("Mode: ➕ JOIN GRUP");
-  if (data.mode === "collect") lines.push("Mode: 🧲 COLLECT GRUP");
+  if (data.mode === "join") lines.push("Mode: JOIN GRUP");
+  if (data.mode === "collect") lines.push("Mode: COLLECT GRUP");
   if (data.log) {
-    lines.push(`Log terakhir: <code>${esc(data.log.slice(-700))}</code>`);
+    lines.push(`Log terakhir: <code>${esc(stripEmoji(data.log.slice(-700)))}</code>`);
   }
   await ctx.replyWithHTML(lines.join("\n"), accountKeyboard(id));
 });
@@ -1350,10 +1490,10 @@ bot.action(/^resetjoin:(.+)$/, async (ctx) => {
   if (!/^[A-Za-z0-9_-]+$/.test(id)) return void ctx.answerCbQuery("ID tidak valid", { show_alert: true });
   await ctx.answerCbQuery();
   if (workers.has(id) || starting.has(id)) {
-    return void ctx.reply(`⏹ ${id} masih berjalan — stop dulu sebelum reset join.`);
+    return void ctx.reply(`${id} masih berjalan — stop dulu sebelum reset join.`);
   }
   await fs.rm(path.join(ACCOUNTS_DIR, id, "join-progress.json"), { force: true });
-  await ctx.reply(`♻️ Join progress ${id} direset. Run join berikutnya mulai dari grup 1.`);
+  await ctx.reply(`Join progress ${id} direset. Run join berikutnya mulai dari grup 1.`);
 });
 
 // ─── Start All queue (human-like scheduling) ─────────────────────────────────
@@ -1410,7 +1550,7 @@ bot.action("startall", async (ctx) => {
   const chatId = ctx.chat?.id;
 
   if (!pending.length) {
-    await ctx.reply("?? Semua akun sudah berjalan / dalam antrean.");
+    await ctx.reply("Semua akun sudah berjalan / dalam antrean.");
     return;
   }
 
@@ -1424,7 +1564,7 @@ bot.action("startall", async (ctx) => {
   startAllGeneration++;
   const gen = startAllGeneration;
   await ctx.reply(
-    `?? ${pending.length} akun masuk antrean — urutan acak, jeda 2-10 menit per start, ` +
+    `${pending.length} akun masuk antrean — urutan acak, jeda 2-10 menit per start, ` +
       `maksimal ${POST_CONCURRENCY} akun posting bersamaan.\n` +
       `Urutan: ${pending.join(", ")}`
   );
@@ -1456,47 +1596,98 @@ bot.action("startall", async (ctx) => {
   })();
 });
 
-// ─── Ringkasan harian ────────────────────────────────────────────────────────
-async function dailySummaryText(): Promise<string> {
+bot.action("startnonlimit", async (ctx) => {
+  if (!auth(ctx)) return void ctx.answerCbQuery("Akses ditolak", { show_alert: true });
+  await ctx.answerCbQuery("Starting non-limit...");
   const ids = await accounts();
-  if (!ids.length) return "📊 Ringkasan harian: tidak ada akun.";
+  const statuses = await Promise.all(ids.map((id) => statusOf(id)));
+  const eligible = statuses.filter((s) => !s.running && !s.limitReason).map((s) => s.id);
+  const skipped = statuses.filter((s) => s.limitReason).map((s) => s.id);
+
+  if (!eligible.length) {
+    await ctx.reply("Tidak ada akun non-limit yang bisa dijalankan.");
+    return;
+  }
+
+  // Batalkan antrean Start All agar akun limit tidak ikut jalan belakangan.
+  startAllQueue = [];
+  startAllGeneration++;
+
+  const results = await Promise.all(eligible.map((id) => startWorker(id)));
+  const started = results.filter((r) => /dimulai|mulai join|mulai kumpulkan/.test(r));
+
+  await ctx.reply(
+    `${started.length}/${eligible.length} akun non-limit dijalankan serentak: ${eligible.join(", ")}` +
+      (skipped.length ? `\nDilewati (limit): ${skipped.join(", ")}` : "")
+  );
+});
+
+// ─── Ringkasan harian ────────────────────────────────────────────────────────
+type SummaryFilter = "all" | "run" | "limit" | "stop";
+type SummaryCategory = "run" | "rest" | "limit" | "stop";
+type AccountStatus = Awaited<ReturnType<typeof statusOf>>;
+
+// Kategori eksklusif (limit menang atas status lain) untuk filter ringkasan.
+function summaryCategory(data: AccountStatus): SummaryCategory {
+  if (data.state === "LIMIT / BLOCKED") return "limit";
+  if (data.running) return "run";
+  if (data.breakUntil) return "rest";
+  return "stop";
+}
+async function dailySummary(filter: SummaryFilter = "all") {
+  const ids = await accounts();
+  if (!ids.length) {
+    return {
+      text: "Ringkasan harian: tidak ada akun.",
+      keyboard: Markup.inlineKeyboard([
+        [Markup.button.callback("Dashboard", "dashboard")],
+      ]),
+    };
+  }
 
   const now = Date.now();
-  const list = await Promise.all(
-    ids.map(async (id) => ({
-      data: await statusOf(id),
-    }))
-  );
+  const all = await Promise.all(ids.map((id) => statusOf(id)));
+  const counts = { run: 0, rest: 0, limit: 0, stop: 0 };
+  for (const data of all) counts[summaryCategory(data)]++;
+
+  const list = all.filter((data) => {
+    const category = summaryCategory(data);
+    if (filter === "all") return true;
+    if (filter === "run") return category === "run" || category === "rest";
+    return category === filter;
+  });
+
+  const filterLabels: Record<SummaryFilter, string> = {
+    all: "Semua",
+    run: "Berjalan + istirahat",
+    limit: "Limit",
+    stop: "Berhenti",
+  };
 
   const lines = [
-    "📊 <b>RINGKASAN HARIAN</b>",
-    `📅 ${esc(
+    "<b>RINGKASAN HARIAN</b>",
+    esc(
       new Date().toLocaleDateString("id-ID", {
         weekday: "long",
         day: "numeric",
         month: "long",
         year: "numeric",
       })
-    )}`,
+    ),
+    `Filter: ${filterLabels[filter]}`,
     "━━━━━━━━━━━━━━━━━━━━",
   ];
 
   let totalAll = 0, directAll = 0, pendingAll = 0, limitedAll = 0, errorAll = 0, unknownAll = 0, msAll = 0;
-  let runningCount = 0;
-  let limitCount = 0;
 
-  for (const { data } of list) {
+  for (const data of list) {
     const d = data.postsToday;
     const posts = d?.total ?? 0;
     const ms = runtimeTodayMs(data.runtime, now);
-    if (data.running) runningCount++;
-    if (data.state === "LIMIT / BLOCKED") limitCount++;
+    const breakdown = breakdownText(d);
 
-    const breakdown = d
-      ? ` (✅${d.direct}${d.pending ? ` 🟡${d.pending}` : ""}${d.limited ? ` 🚫${d.limited}` : ""}${d.error ? ` ❌${d.error}` : ""}${d.unknown ? ` ❓${d.unknown}` : ""})`
-      : "";
     lines.push(
-      `${data.icon} <b>${esc(data.id)}</b> ⏱ ${fmtDuration(ms)} • 📤 ${posts} post${breakdown}`
+      `${data.icon} <b>${esc(data.id)}</b> — ${posts} post${breakdown ? ` (${breakdown})` : ""} • ${fmtDuration(ms)}`
     );
 
     totalAll += posts;
@@ -1508,40 +1699,75 @@ async function dailySummaryText(): Promise<string> {
     msAll += ms;
   }
 
-  const totalBreakdown = [
-    directAll ? `✅${directAll}` : "",
-    pendingAll ? `🟡${pendingAll}` : "",
-    limitedAll ? `🚫${limitedAll}` : "",
-    errorAll ? `❌${errorAll}` : "",
-    unknownAll ? `❓${unknownAll}` : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
+  const totals: DailyStat = {
+    total: totalAll,
+    direct: directAll,
+    pending: pendingAll,
+    error: errorAll,
+    limited: limitedAll,
+    unknown: unknownAll,
+  };
+  const totalBreakdown = breakdownText(totals);
 
   lines.push(
     "━━━━━━━━━━━━━━━━━━━━",
-    `TOTAL: 📤 ${totalAll} post${totalBreakdown ? ` (${totalBreakdown})` : ""} • ⏱ ${fmtDuration(msAll)}`,
-    `🟢 ${runningCount}/${list.length} akun masih berjalan${limitCount ? ` • 🚫 ${limitCount} akun limit` : ""}`
+    `TOTAL: ${totalAll} post${totalBreakdown ? ` (${totalBreakdown})` : ""} • ${fmtDuration(msAll)}`,
+    `Berjalan: ${counts.run} • Istirahat: ${counts.rest} • Limit: ${counts.limit} • Berhenti: ${counts.stop} (${all.length} akun)`
   );
+  if (!list.length) lines.push("Tidak ada akun pada filter ini.");
 
-  return lines.join("\n");
+  const mark = (key: SummaryFilter) => (filter === key ? "[x] " : "");
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback(`${mark("all")}Semua (${all.length})`, "sumf:all"),
+      Markup.button.callback(
+        `${mark("run")}Berjalan + istirahat (${counts.run + counts.rest})`,
+        "sumf:run"
+      ),
+    ],
+    [
+      Markup.button.callback(`${mark("limit")}Limit (${counts.limit})`, "sumf:limit"),
+      Markup.button.callback(`${mark("stop")}Berhenti (${counts.stop})`, "sumf:stop"),
+    ],
+    [Markup.button.callback("Dashboard", "dashboard")],
+  ]);
+
+  return { text: lines.join("\n"), keyboard };
+}
+
+async function sendSummary(
+  ctx: Context,
+  filter: SummaryFilter,
+  edit: boolean
+): Promise<void> {
+  const { text, keyboard } = await dailySummary(filter);
+  if (edit) {
+    try {
+      await ctx.editMessageText(text, { parse_mode: "HTML", ...keyboard });
+      return;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/message is not modified/i.test(message)) return;
+    }
+  }
+  await ctx.replyWithHTML(text, keyboard);
 }
 
 bot.command("ringkasan", async (ctx) => {
-  if (!auth(ctx)) return void ctx.reply("⛔ Akses ditolak.");
-  await ctx.replyWithHTML(
-    await dailySummaryText(),
-    Markup.inlineKeyboard([[Markup.button.callback("⬅ Dashboard", "dashboard")]])
-  );
+  if (!auth(ctx)) return void ctx.reply("Akses ditolak.");
+  await sendSummary(ctx, "all", false);
 });
 
 bot.action("summary", async (ctx) => {
   if (!auth(ctx)) return void ctx.answerCbQuery("Akses ditolak", { show_alert: true });
   await ctx.answerCbQuery();
-  await ctx.replyWithHTML(
-    await dailySummaryText(),
-    Markup.inlineKeyboard([[Markup.button.callback("⬅ Dashboard", "dashboard")]])
-  );
+  await sendSummary(ctx, "all", false);
+});
+
+bot.action(/^sumf:(all|run|limit|stop)$/, async (ctx) => {
+  if (!auth(ctx)) return void ctx.answerCbQuery("Akses ditolak", { show_alert: true });
+  await ctx.answerCbQuery();
+  await sendSummary(ctx, ctx.match[1] as SummaryFilter, true);
 });
 
 bot.action("stopall", async (ctx) => {
@@ -1559,13 +1785,13 @@ async function cancelBatchDraft(ctx: Context): Promise<void> {
   const draft = getBatchDraft(chatId);
   if (!draft) {
     batchDrafts.delete(chatId);
-    return void ctx.reply("ℹ️ Tidak ada proses tambah batch yang aktif.");
+    return void ctx.reply("Tidak ada proses tambah batch yang aktif.");
   }
   batchDrafts.delete(chatId);
   if (draft.step === "caption") {
     await fs.rm(draft.file, { force: true }).catch(() => {});
   }
-  await ctx.reply("❌ Tambah batch dibatalkan.");
+  await ctx.reply("Tambah batch dibatalkan.");
 }
 
 // Draft menua otomatis supaya tidak "nyangkut" kalau admin berhenti di tengah.
@@ -1581,7 +1807,7 @@ function getBatchDraft(chatId: number): BatchDraft | null {
 }
 
 bot.command("batch", async (ctx) => {
-  if (!auth(ctx)) return void ctx.reply("⛔ Akses ditolak.");
+  if (!auth(ctx)) return void ctx.reply("Akses ditolak.");
   await replyBatchManager(ctx);
 });
 
@@ -1612,7 +1838,7 @@ bot.action("batchadd", async (ctx) => {
   batchDrafts.set(chatId, { step: "photo", at: Date.now() });
   await ctx.replyWithHTML(
     batchAddPrompt(),
-    Markup.inlineKeyboard([[Markup.button.callback("❌ Batal", "batchcancel")]])
+    Markup.inlineKeyboard([[Markup.button.callback("Batal", "batchcancel")]])
   );
 });
 
@@ -1623,7 +1849,7 @@ bot.action("batchcancel", async (ctx) => {
 });
 
 bot.command("batal", async (ctx) => {
-  if (!auth(ctx)) return void ctx.reply("⛔ Akses ditolak.");
+  if (!auth(ctx)) return void ctx.reply("Akses ditolak.");
   await cancelBatchDraft(ctx);
 });
 
@@ -1634,12 +1860,12 @@ bot.action(/^batchdel:(\d+)$/, async (ctx) => {
   const active = activeWorkerIds();
   if (active.length) {
     return void ctx.reply(
-      `⛔ Stop dulu semua worker (${active.join(", ")}).\nHapus batch menggeser nomor batch lain, jadi tidak bisa saat worker aktif.`
+      `Stop dulu semua worker (${active.join(", ")}).\nHapus batch menggeser nomor batch lain, jadi tidak bisa saat worker aktif.`
     );
   }
   await ctx.replyWithHTML(
     [
-      `⚠️ <b>Hapus Batch ${n}?</b>`,
+      `<b>Hapus Batch ${n}?</b>`,
       "",
       "Folder konten batch ini akan dihapus dari semua akun.",
       "Nomor batch setelahnya digeser agar tetap berurutan 1, 2, 3, dst.",
@@ -1647,8 +1873,8 @@ bot.action(/^batchdel:(\d+)$/, async (ctx) => {
     ].join("\n"),
     Markup.inlineKeyboard([
       [
-        Markup.button.callback("✅ Ya, hapus", `batchdelok:${n}`),
-        Markup.button.callback("❌ Batal", "batch"),
+        Markup.button.callback("Ya, hapus", `batchdelok:${n}`),
+        Markup.button.callback("Batal", "batch"),
       ],
     ])
   );
@@ -1659,12 +1885,12 @@ bot.action(/^batchdelok:(\d+)$/, async (ctx) => {
   const n = Number(ctx.match[1]);
   await ctx.answerCbQuery("Menghapus...");
   if (batchMutation) {
-    return void ctx.reply("⏳ Operasi batch lain sedang berjalan. Coba lagi sebentar.");
+    return void ctx.reply("Operasi batch lain sedang berjalan. Coba lagi sebentar.");
   }
   const active = activeWorkerIds();
   if (active.length) {
     return void ctx.reply(
-      `⛔ Stop dulu semua worker (${active.join(", ")}).\nHapus batch menggeser nomor batch lain, jadi tidak bisa saat worker aktif.`
+      `Stop dulu semua worker (${active.join(", ")}).\nHapus batch menggeser nomor batch lain, jadi tidak bisa saat worker aktif.`
     );
   }
 
@@ -1672,26 +1898,26 @@ bot.action(/^batchdelok:(\d+)$/, async (ctx) => {
   try {
     const result = await deleteBatchFromAll(n);
     const lines = [
-      `🗑 <b>Batch ${n}</b> dihapus dari ${result.ok.length} akun.`,
+      `<b>Batch ${n}</b> dihapus dari ${result.ok.length} akun.`,
     ];
     if (result.failed.length) {
-      lines.push(`⚠️ Gagal: ${esc(result.failed.join(", "))}`);
+      lines.push(`Gagal: ${esc(result.failed.join(", "))}`);
       lines.push("Nomor batch tidak digeser. Ulangi hapus setelah masalahnya beres.");
     } else {
       const total = (await allBatchNumbers()).length;
       lines.push(
         total
-          ? `📦 Sisa ${total} batch, nomor dirapikan 1..${total}.`
-          : "📦 Semua batch kosong. Batch baru akan mulai dari nomor 1."
+          ? `Sisa ${total} batch, nomor dirapikan 1..${total}.`
+          : "Semua batch kosong. Batch baru akan mulai dari nomor 1."
       );
     }
     await ctx.replyWithHTML(
       lines.join("\n"),
-      Markup.inlineKeyboard([[Markup.button.callback("📦 Lihat Batch", "batch")]])
+      Markup.inlineKeyboard([[Markup.button.callback("Lihat Batch", "batch")]])
     );
   } catch (err) {
     await ctx.reply(
-      `❌ Gagal menghapus batch: ${String((err as Error)?.message ?? err).slice(0, 200)}`
+      `Gagal menghapus batch: ${String((err as Error)?.message ?? err).slice(0, 200)}`
     );
   } finally {
     batchMutation = false;
@@ -1720,13 +1946,13 @@ bot.on(message("photo"), async (ctx) => {
   const photo = ctx.message.photo.at(-1);
   if (!photo) return;
   if (photo.file_size && photo.file_size > 20 * 1024 * 1024) {
-    return void ctx.reply("❌ Ukuran gambar melebihi batas Telegram (20 MB).");
+    return void ctx.reply("Ukuran gambar melebihi batas Telegram (20 MB).");
   }
   try {
     await handleBatchImage(ctx, photo.file_id, ".jpg", ctx.message.caption ?? "");
   } catch (err) {
     const reason = String((err as Error)?.message ?? err).slice(0, 200);
-    await ctx.reply(`❌ Gagal mengambil gambar: ${reason}\nCoba kirim ulang.`);
+    await ctx.reply(`Gagal mengambil gambar: ${reason}\nCoba kirim ulang.`);
   }
 });
 
@@ -1737,21 +1963,21 @@ bot.on(message("document"), async (ctx) => {
   const doc = ctx.message.document;
   const mime = doc.mime_type ?? "";
   if (!mime.startsWith("image/")) {
-    return void ctx.reply("❌ File harus berupa gambar (png/jpg/jpeg/gif/webp).");
+    return void ctx.reply("File harus berupa gambar (png/jpg/jpeg/gif/webp).");
   }
   if (doc.file_size && doc.file_size > 20 * 1024 * 1024) {
-    return void ctx.reply("❌ Ukuran file melebihi batas Telegram (20 MB).");
+    return void ctx.reply("Ukuran file melebihi batas Telegram (20 MB).");
   }
   const extFromName = path.extname(doc.file_name ?? "").toLowerCase();
   const ext = IMAGE_EXTENSIONS.has(extFromName) ? extFromName : extFromMime(mime);
   if (!ext) {
-    return void ctx.reply("❌ Tipe gambar tidak didukung. Gunakan png/jpg/jpeg/gif/webp.");
+    return void ctx.reply("Tipe gambar tidak didukung. Gunakan png/jpg/jpeg/gif/webp.");
   }
   try {
     await handleBatchImage(ctx, doc.file_id, ext, ctx.message.caption ?? "");
   } catch (err) {
     const reason = String((err as Error)?.message ?? err).slice(0, 200);
-    await ctx.reply(`❌ Gagal mengambil file: ${reason}\nCoba kirim ulang.`);
+    await ctx.reply(`Gagal mengambil file: ${reason}\nCoba kirim ulang.`);
   }
 });
 
@@ -1838,7 +2064,7 @@ async function watchdogPass(): Promise<void> {
 
     hangAlerted.add(id);
     await sendToAdmins(
-      `🥴 <b>${esc(id)}</b> berstatus RUNNING tetapi tidak menulis log selama ${Math.round(HANG_TOLERANCE_MS / 60000)} menit — terindikasi hang. Restart terawasi dijalankan.`
+      `<b>${esc(id)}</b> berstatus RUNNING tetapi tidak menulis log selama ${Math.round(HANG_TOLERANCE_MS / 60000)} menit — terindikasi hang. Restart terawasi dijalankan.`
     );
     await stopWorkerInternal(id, false);
   }
@@ -1898,6 +2124,10 @@ void (async () => {
       ),
     3000
   );
+  // Lanjutkan jadwal istirahat yang tertinggal dari proses dashboard sebelumnya.
+  void recoverBreakTimers().catch((err) =>
+    console.error("Gagal memulihkan jadwal istirahat:", err)
+  );
   // Auto-start akun dari env AUTOSTART (koma-dipisah) dengan stagger
   // START_ALL_STAGGER_MS — untuk menjalankan akun tanpa klik manual.
   const autostartIds = (process.env.AUTOSTART ?? "")
@@ -1921,7 +2151,7 @@ void (async () => {
   .catch((err) => {
     // Tanpa catch, kegagalan launch (mis. 409 karena instance lama belum
     // melepas getUpdates) bikin proses hidup zombie tanpa jejak.
-    console.error("❌ Telegram launch gagal — dashboard berhenti:", err);
+    console.error("Telegram launch gagal — dashboard berhenti:", err);
     process.exit(1);
   });
 })();

@@ -123,15 +123,47 @@ async function saveHistory(accountId: string, history: HistoryFile): Promise<voi
   await fs.writeFile(await historyPath(accountId), JSON.stringify(trimmed, null, 2));
 }
 
+// Base dari humanize-assets.py sudah membawa prefix/suffix; lepas dulu supaya
+// variasi baru tidak menumpuk ("Buruan sebelum habis. Buruan sebelum habis.").
+function stripKnownAffixes(text: string): string {
+  let out = text.trim();
+  for (const prefix of PREFIXES) {
+    if (prefix && out.toLowerCase().startsWith(prefix.toLowerCase())) {
+      out = out.slice(prefix.length).trimStart();
+      break;
+    }
+  }
+  for (const suffix of SUFFIXES) {
+    if (suffix && out.toLowerCase().endsWith(suffix.toLowerCase())) {
+      out = out.slice(0, out.length - suffix.length).trimEnd();
+      break;
+    }
+  }
+  return out;
+}
+
+function containsPhrase(text: string, phrase: string): boolean {
+  const core = phrase.toLowerCase().replace(/[!?.,]+$/g, "").replace(/\s+/g, " ").trim();
+  if (!core) return false;
+  return text.toLowerCase().replace(/\s+/g, " ").includes(core);
+}
+
 function templateCaption(base: string, rng: () => number): string {
   const url = extractUrl(base);
   if (!url) return base;
 
-  let caption = base.replace(url, "").trim();
+  let caption = stripKnownAffixes(base.replace(url, "").trim());
   caption = applySynonyms(caption, rng);
 
-  const prefix = PREFIXES[Math.floor(rng() * PREFIXES.length)];
-  const suffix = SUFFIXES[Math.floor(rng() * SUFFIXES.length)];
+  let prefix = PREFIXES[Math.floor(rng() * PREFIXES.length)];
+  let suffix = SUFFIXES[Math.floor(rng() * SUFFIXES.length)];
+  // Jangan ulang frasa yang sudah ada di caption ("Barangkali masih ada,
+  // barangkali masih ada, ...").
+  if (containsPhrase(caption, prefix)) prefix = "";
+  if (/^Barangkali masih ada/i.test(prefix) && /^(siapa tau|siapa tahu|mana tau|mungkin|barangkali)\b/i.test(caption)) {
+    prefix = "";
+  }
+  if (containsPhrase(caption, suffix)) suffix = "";
   const candidate = `${prefix}${caption}${suffix}`.trim();
 
   const layouts = [
@@ -163,8 +195,9 @@ function validateCaption(
   if (/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(generated)) {
     return { ok: false, reason: "mengandung emoji" };
   }
-  // No new numeric claims.
-  const baseNums = extractNumbers(base).join(",");
+  // No new numeric claims. URL dibuang di kedua sisi: digit di dalam link
+  // (mis. .../2LZeX3ctFf) bukan klaim angka.
+  const baseNums = extractNumbers(base.replace(url, "")).join(",");
   const genNums = extractNumbers(generated.replace(url, "")).join(",");
   if (baseNums !== genNums) {
     return { ok: false, reason: "angka berubah" };

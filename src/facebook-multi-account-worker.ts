@@ -51,7 +51,8 @@ const ACCOUNT_ID = (process.argv[2] || process.env.ACCOUNT_ID || "").trim();
 // ditulis setelah proses ini hidup â€” mencegah STOP kilat saat start terabaikan.
 const LAUNCH_AT = Number(process.env.WORKER_LAUNCH_AT) || Date.now();
 // Mode: "collect" = kumpulkan grup yang sudah di-join akun ini ke groups-pool.txt,
-// "join" = join grup dari groups-pool.txt. Kosong = auto-poster biasa.
+// "join" = join grup dari groups-pool.txt, "login" = paksa login ulang.
+// Kosong = auto-poster biasa.
 const RUN_MODE = (process.argv[3] || process.env.RUN_MODE || "").trim();
 const RUN_BATCH = Number(process.argv[4] || process.env.RUN_BATCH || "0");
 const RUN_GROUP = Number(process.argv[5] || process.env.RUN_GROUP || "0");
@@ -61,9 +62,14 @@ const JOIN_MODE = RUN_MODE === "join";
 // Mode "one": uji 1 posting (batch/group tertentu, default 1/1), lalu close.
 // Untuk deteksi limit per akun; progress asli tidak ditimpa.
 const ONE_POST_MODE = RUN_MODE === "one";
-// Akun dengan titik mulai batch diacak setiap start + siklus ulang ke batch 1
-// setelah semua batch habis (tidak idle menunggu konten baru).
+// Mode "login": hapus sesi lama lalu login ulang (creds.json / manual).
+const LOGIN_MODE = RUN_MODE === "login";
+// Akun yang titik mulai batch-nya diacak setiap start.
 const RANDOM_START_ACCOUNTS = /^fb(0[1-9]|1[01])$/;
+// Semua akun posting mengulang ke batch 1 setelah batch terakhir selesai.
+const LOOP_AFTER_COMPLETE = !COLLECT_MODE && !JOIN_MODE && !ONE_POST_MODE;
+// Di-set dashboard saat wake dari istirahat: jangan acak batch, lanjut progress.
+const RESUME_AFTER_BREAK = process.env.RESUME_AFTER_BREAK === "1";
 
 if (!ACCOUNT_ID) {
   console.error("âŒ Account ID belum diberikan. Contoh: npm start -- fb01");
@@ -85,6 +91,7 @@ const LOCALSTORAGE_FILE = path.join(ACCOUNT_DIR, "localstorage.txt");
 const BROWSER_PROFILE_DIR = path.join(ACCOUNT_DIR, "browser-profile");
 const DEBUG_SCREENSHOT = path.join(ACCOUNT_DIR, "debug-groups-page.png");
 const STOP_FILE = path.join(ACCOUNT_DIR, "stop.request");
+const BREAK_FILE = path.join(ACCOUNT_DIR, "break.json");
 const POSTING_STATS_FILE = path.join(ACCOUNT_DIR, "posting-stats.json");
 const JOIN_PROGRESS_FILE = path.join(ACCOUNT_DIR, "join-progress.json");
 // Pool grup hasil "collect" dari akun-akun yang sudah join; diedit manual juga boleh.
@@ -119,17 +126,50 @@ const POST_DELAY_MIN_MS = Number(process.env.POST_DELAY_MIN_MS || "45000");
 const POST_DELAY_MAX_MS = Number(process.env.POST_DELAY_MAX_MS || "150000");
 
 // â”€â”€â”€ Human-like session pacing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// Setelah N posting sukses, worker "istirahat" seperti manusia (break 1 jam).
-// Heartbeat log tiap 5 menit supaya dashboard watchdog tidak menganggap hang.
-const HUMAN_SESSION_POSTS = Number(process.env.HUMAN_SESSION_POSTS || "15");
-const HUMAN_BREAK_MS = Number(process.env.HUMAN_BREAK_MS || String(60 * 60 * 1000));
+// Setelah N posting sukses, worker "istirahat" seperti manusia (break 15 menit).
+// Heartbeat dipakai hanya di fallback (break.json gagal ditulis).
+const HUMAN_SESSION_POSTS = Number(process.env.HUMAN_SESSION_POSTS || "20");
+const HUMAN_BREAK_MS = Number(process.env.HUMAN_BREAK_MS || String(15 * 60 * 1000));
 const HUMAN_HEARTBEAT_MS = Number(process.env.HUMAN_HEARTBEAT_MS || String(5 * 60 * 1000));
 
 /**
- * Istirahat manusiawi dengan heartbeat + STOP check.
- * Returns true bila STOP diminta (caller harus keluar rapi).
+ * Istirahat manusiawi: catat jadwal lalu minta caller keluar agar dashboard
+ * men-start ulang worker tepat waktu (status terlihat "istirahat").
+ * Returns "exit" (keluar), "continue" (fallback sleep selesai), "stop".
  */
-async function humanBreak(totalMs: number): Promise<boolean> {
+async function humanBreak(
+  totalMs: number,
+  batch: number,
+  groupIdx: number
+): Promise<"exit" | "continue" | "stop"> {
+  if (totalMs <= 0) return "continue";
+
+  const until = new Date(Date.now() + totalMs);
+  const marker: BreakMarker = {
+    until: until.toISOString(),
+    batch,
+    groupIdx,
+    startedAt: new Date().toISOString(),
+  };
+  try {
+    await fs.writeFile(BREAK_FILE, JSON.stringify(marker, null, 2));
+    await log(
+      `⏸️ Istirahat manusiawi ${(totalMs / 60000).toFixed(0)} menit — proses dihentikan, lanjut otomatis pukul ${until.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" })}...`
+    );
+    return "exit";
+  } catch {
+    await log(
+      `⚠️ Gagal menulis break.json — fallback istirahat di proses ${(totalMs / 60000).toFixed(0)} menit...`
+    );
+  }
+
+  const stopped = await humanBreakLegacy(totalMs);
+  return stopped ? "stop" : "continue";
+}
+
+// Fallback lama: tidur di proses + heartbeat bila break.json gagal ditulis.
+// Returns true bila STOP diminta.
+async function humanBreakLegacy(totalMs: number): Promise<boolean> {
   if (totalMs <= 0) return false;
   const end = Date.now() + totalMs;
   await log(
@@ -167,6 +207,14 @@ interface Progress {
   batch: number;
   groupIdx: number;
   timestamp: string;
+}
+
+// Marker istirahat: dibaca dashboard untuk menampilkan status & wake otomatis.
+interface BreakMarker {
+  until: string;
+  batch: number;
+  groupIdx: number;
+  startedAt: string;
 }
 
 interface PostingStats {
@@ -2518,7 +2566,7 @@ async function main(): Promise<void> {
   const accountConfig = await loadAccountConfig();
   let totalBatches = await detectTotalBatches(accountConfig);
 
-  if (totalBatches === 0 && !COLLECT_MODE && !JOIN_MODE) {
+  if (totalBatches === 0 && !COLLECT_MODE && !JOIN_MODE && !LOGIN_MODE) {
     await log(`âŒ Tidak ada batch di ${CONTENT_DIR}`);
     await log(`   Buat folder seperti accounts/${ACCOUNT_ID}/content/1/`);
     return;
@@ -2538,7 +2586,7 @@ async function main(): Promise<void> {
   let startBatch = 1;
   let startGroupIdx = 0;
 
-  const savedProgress = COLLECT_MODE || JOIN_MODE ? null : await loadProgress();
+  const savedProgress = COLLECT_MODE || JOIN_MODE || LOGIN_MODE ? null : await loadProgress();
 
   if (RUN_BATCH > 0 || RUN_GROUP > 0) {
     startBatch = Math.max(1, RUN_BATCH || savedProgress?.batch || 1);
@@ -2553,7 +2601,7 @@ async function main(): Promise<void> {
     await log(
       `â–¶ï¸  Auto-resume: batch ${startBatch}, group berikutnya ke-${startGroupIdx + 1}`
     );
-  } else if (!COLLECT_MODE && !JOIN_MODE) {
+  } else if (!COLLECT_MODE && !JOIN_MODE && !LOGIN_MODE) {
     await resetPostingStats();
     await log("â–¶ï¸  Belum ada progress â†’ mulai dari batch 1, group 1");
   }
@@ -2563,7 +2611,9 @@ async function main(): Promise<void> {
   if (
     !COLLECT_MODE &&
     !JOIN_MODE &&
+    !LOGIN_MODE &&
     !ONE_POST_MODE &&
+    !RESUME_AFTER_BREAK &&
     !(RUN_BATCH > 0 || RUN_GROUP > 0) &&
     RANDOM_START_ACCOUNTS.test(ACCOUNT_ID)
   ) {
@@ -2574,19 +2624,36 @@ async function main(): Promise<void> {
     );
   }
 
+  // Marker istirahat hanya sekali pakai; hapus agar status dashboard tidak
+  // nyangkut "istirahat" setelah worker hidup lagi.
+  if (!COLLECT_MODE && !JOIN_MODE && !LOGIN_MODE && !ONE_POST_MODE) {
+    await fs.rm(BREAK_FILE, { force: true }).catch(() => {});
+    if (RESUME_AFTER_BREAK) {
+      await log(
+        `▶️ Lanjut setelah istirahat: batch ${startBatch}, group ${startGroupIdx + 1}`
+      );
+    }
+  }
+
   // Progress sentinel (totalBatches + 1) = semua batch sudah pernah selesai.
-  // Keluar sebelum launch Chrome; batch berikutnya otomatis diproses saat
-  // dashboard menambah konten baru (nomor batch mengikuti sentinel ini).
+  // Akun posting mengulang dari batch 1; mode uji 1 posting tetap keluar.
   if (
     !COLLECT_MODE &&
     !JOIN_MODE &&
+    !LOGIN_MODE &&
     !(RUN_BATCH > 0 || RUN_GROUP > 0) &&
     startBatch > totalBatches
   ) {
-    await log(
-      `ðŸŽ‰ Semua batch selesai (${totalBatches} batch). Menunggu konten berikutnya.`
-    );
-    return;
+    if (!LOOP_AFTER_COMPLETE) {
+      await log(
+        `🎉 Semua batch selesai (${totalBatches} batch). Menunggu konten berikutnya.`
+      );
+      return;
+    }
+    await log(`🔁 Batch sudah habis (${totalBatches} batch) → ulang dari batch 1.`);
+    startBatch = 1;
+    startGroupIdx = 0;
+    await saveProgress(1, 0);
   }
 
   // â”€â”€ Launch browser â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2630,6 +2697,44 @@ async function main(): Promise<void> {
   browser.on("disconnected", () => {
     void log("ðŸ”Œ Browser disconnected (normal saat selesai/stop; abnormal jika tiba-tiba saat posting).");
   });
+
+  // Mode login: hapus sesi lama (cookie + localStorage) lalu login ulang.
+  // File cookie.txt/localstorage.txt tidak di-inject dulu supaya sesi lama
+  // tidak langsung memulihkan login; keduanya ditimpa lagi setelah sukses.
+  if (LOGIN_MODE) {
+    await log("🔐 Mode login: menghapus sesi Facebook lama di profil ini...");
+    try {
+      const cdp = await page.createCDPSession();
+      await cdp.send("Network.clearBrowserCookies").catch(() => {});
+      await cdp.send("Network.clearBrowserCache").catch(() => {});
+      await cdp.detach().catch(() => {});
+    } catch {}
+    try {
+      await page.goto("https://web.facebook.com", {
+        waitUntil: "domcontentloaded",
+        timeout: NAV_TIMEOUT,
+      });
+      await page.evaluate(() => {
+        localStorage.clear();
+        sessionStorage.clear();
+      });
+    } catch {}
+    let loggedIn = false;
+    const creds = await loadCreds();
+    if (creds) {
+      loggedIn = await tryAutoLogin(page, creds);
+    }
+    if (!loggedIn) {
+      await log(
+        "🔐 Auto-login tidak berhasil — silakan login manual di jendela browser."
+      );
+      await ensureFacebookLoggedIn(page);
+    }
+    await exportSessionFiles(page);
+    await log("✅ Mode login selesai.");
+    await browser.close();
+    return;
+  }
 
   // Sesi: profil dulu, file hanya bootstrap â€” sekali login tahan lama.
   for (let attempt = 1; ; attempt++) {
@@ -2763,23 +2868,22 @@ async function main(): Promise<void> {
   // Posting sukses dalam sesi saat ini (reset setelah istirahat manusiawi).
   let postedInSession = 0;
 
-  // Loop batch utama. Untuk RANDOM_START_ACCOUNTS siklus berulang: setelah
-  // batch terakhir selesai kembali ke batch 1 (re-detect total batch supaya
-  // konten baru dari dashboard langsung ikut di siklus berikutnya). Akun lain
-  // keluar seperti dulu setelah semua batch selesai.
-  const loopForever = RANDOM_START_ACCOUNTS.test(ACCOUNT_ID) && !COLLECT_MODE && !JOIN_MODE;
+  // Loop batch utama: setelah batch terakhir, deteksi ulang total batch
+  // (konten baru ikut siklus berikutnya) lalu kembali ke batch 1.
+  const loopForever = LOOP_AFTER_COMPLETE;
   let batch = startBatch;
   while (true) {
     if (batch > totalBatches) {
       if (!loopForever) break;
       totalBatches = await detectTotalBatches(accountConfig);
-      await log(`\n🔁 Semua batch selesai â†’ kembali ke batch 1 (total: ${totalBatches})`);
+      await log(`\n🔁 Batch terakhir selesai → kembali ke batch 1 (total: ${totalBatches})`);
       batch = 1;
       startGroupIdx = 0;
+      await saveProgress(1, 0);
       const wrapDelay = randomBetween(5 * 60000, 15 * 60000);
       if (await waitWithStopCheck(wrapDelay)) {
         await saveProgress(1, 0);
-        await log(`â¹ STOP diminta â†’ progress disimpan untuk batch 1, group 1`);
+        await log(`⏹ STOP diminta → progress disimpan untuk batch 1, group 1`);
         await browser.close();
         return;
       }
@@ -2892,13 +2996,14 @@ async function main(): Promise<void> {
               await saveProgress(batch, i + 1);
               await log(`ðŸ’¾ Progress: batch=${batch}, nextGroup=${i + 2} (sesi: ${postedInSession}/${HUMAN_SESSION_POSTS})`);
               await logPostingSummary();
-              // 15 posting sukses per sesi â†’ istirahat manusiawi 1 jam.
+              // 20 posting sukses per sesi → istirahat manusiawi 15 menit.
               if (
                 HUMAN_SESSION_POSTS > 0 &&
                 postedInSession >= HUMAN_SESSION_POSTS
               ) {
                 postedInSession = 0;
-                if (await humanBreak(HUMAN_BREAK_MS)) {
+                const action = await humanBreak(HUMAN_BREAK_MS, batch, i + 1);
+                if (action !== "continue") {
                   await saveProgress(batch, i + 1);
                   await browser.close();
                   return;
